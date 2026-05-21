@@ -1,0 +1,11 @@
+.venv
+.git
+.vscode
+.DS_Store
+**/.DS_Store
+**/__pycache__
+**/*.pyc
+unified_framework/.git
+unified_framework/.vscode
+unified_framework/inputs
+unified_framework/infeasible.ilp

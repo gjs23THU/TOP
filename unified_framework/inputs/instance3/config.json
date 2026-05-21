@@ -1,0 +1,25 @@
+{
+  "case_id": "instance3",
+  "algorithm": {
+    "name": "ea",
+    "mode": "normal",
+    "obj": "maxRevenue",
+    "timeLimit": null,
+    "decimal": 5,
+    "random_seed": null
+  },
+  "max-distance": 10.0,
+  "total-time/day": [
+    300.0,
+    410.0,
+    380.0
+  ],
+  "total-power/day": [
+    3500.0,
+    5000.0,
+    4000.0
+  ],
+  "min-continuous": 3,
+  "12-gap": 80.0,
+  "23-gap": 290.0
+}
