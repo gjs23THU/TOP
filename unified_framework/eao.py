@@ -5,6 +5,7 @@ Created on Tue Apr  2 14:53:23 2024
 @author: chen wentian
 """
 import os
+import signal
 import threading
 import time
 import numpy as np
@@ -27,6 +28,7 @@ class _ScipStatus:
     OPTIMAL = "optimal"
     INFEASIBLE = "infeasible"
     TIMELIMIT = "timelimit"
+    USER_INTERRUPT = "userinterrupt"
 
 
 class _ScipCallback:
@@ -169,11 +171,16 @@ class _ScipModel:
         return None
 
     def optimize(self, callback=None):
-        self._model.optimize()
-        self.Status = self._model.getStatus()
-        self.SolCount = self._model.getNSols()
-        if self.SolCount >= 1:
-            self.objVal = self._model.getObjVal()
+        try:
+            self._model.optimize()
+        finally:
+            self.Status = self._model.getStatus()
+            self.SolCount = self._model.getNSols()
+            if self.SolCount >= 1:
+                self.objVal = self._model.getObjVal()
+
+    def interruptSolve(self):
+        return self._model.interruptSolve()
 
     def computeIIS(self):
         return None
@@ -208,16 +215,8 @@ class _ScipModel:
     def setSolVal(self, sol, var, value):
         return self._model.setSolVal(sol, var, value)
 
-    def trySol(self, sol):
-        return self._model.trySol(
-            sol,
-            printreason=False,
-            completely=True,
-            checkbounds=True,
-            checkintegrality=True,
-            checklprows=True,
-            free=False,
-        )
+    def trySol(self, sol, printreason=False):
+        return self._model.addSol(sol, free=True)
 
     def checkSol(self, sol):
         return self._model.checkSol(
@@ -393,6 +392,8 @@ class task_optimize(object):
         self.__MDistance = info["max-distance"][0]
         self.__TTime = list(map(float, info["total-time/day"][0].split(";")))
         self.__TPower = list(map(float, info["total-power/day"][0].split(";")))
+        self.__RawTTime = self.__TTime.copy()
+        self.__RawTPower = self.__TPower.copy()
         self.__Mincontinuous = info["min-continuous"][0]
         self.__12gap = info["12-gap"][0]
         self.__23gap = info["23-gap"][0]
@@ -748,6 +749,14 @@ class task_optimize(object):
         if task_index == self.__opoint[3][1]:
             return 3, 3
 
+        tag = self.__task.loc[task_index, "tag"]
+        if isinstance(tag, str):
+            tag = tag.strip()
+            if tag in {"12s", "12e"}:
+                return 0, 1
+            if tag in {"23s", "23e"}:
+                return 1, 2
+
         day = self.__task.loc[task_index, "day"]
         if pd.isna(day):
             return 0, 2
@@ -952,7 +961,7 @@ class task_optimize(object):
             gp.quicksum(
                 (self.__x.sum("*", "*", "*", k) for k in self.__remtaskindex)
             )
-            == 1,
+            >= 1,
             name="remote",
         )
         return None
@@ -982,17 +991,10 @@ class task_optimize(object):
             ),
             name="time1",
         )
-        temp = list(point.select(self.__opoint[1][0], "*"))
-        temp.remove(point.select(self.__opoint[1][0], self.__opoint[1][1])[0])
-        self.__m.addConstrs(
-            (
-                self.__W[k[0], k[1]] <= self.__TTime[0]
-                for k in list(point.select(self.__opoint[1][0], "*"))
-            ),
+        self.__m.addConstr(
+            self.__W[*self.__opoint[1]] <= self.__TTime[0],
             name="time2",
         )
-        temp = list(point.select(self.__opoint[2][0], "*"))
-        temp.remove(point.select(self.__opoint[2][0], self.__opoint[2][1])[0])
         self.__m.addConstr(
             self.__W[*self.__opoint[2]] - self.__W[*self.__opoint[1]]
             <= self.__TTime[1],
@@ -1225,17 +1227,10 @@ class task_optimize(object):
             ),
             name="power1",
         )
-        temp = list(point.select(self.__opoint[1][0], "*"))
-        temp.remove(point.select(self.__opoint[1][0], self.__opoint[1][1])[0])
-        self.__m.addConstrs(
-            (
-                self.__Q[k[0], k[1]] <= self.__TPower[0]
-                for k in list(point.select(self.__opoint[1][0], "*"))
-            ),
+        self.__m.addConstr(
+            self.__Q[*self.__opoint[1]] <= self.__TPower[0],
             name="power2",
         )
-        temp = list(point.select(self.__opoint[2][0], "*"))
-        temp.remove(point.select(self.__opoint[2][0], self.__opoint[2][1])[0])
         self.__m.addConstr(
             self.__Q[*self.__opoint[2]] - self.__Q[*self.__opoint[1]]
             <= self.__TPower[1],
@@ -1287,127 +1282,131 @@ class task_optimize(object):
             i: self.__pmatrix.loc["探测起点1", name] for i, name in point_name.items()
         }
         for i, k in point:
+            if (i, k) in self.__opoint:
+                continue
+            selected = self.__x.sum("*", "*", i, k)
+            inactive = M * (1 - selected)
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                >= self.__W[i, k] + eps - M * (1 - self.__Ws1[i, k]),
+                >= self.__W[i, k] + eps - M * (1 - self.__Ws1[i, k]) - inactive,
                 name=f"safetimeday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                <= self.__W[i, k] + M * self.__Ws1[i, k],
+                <= self.__W[i, k] + M * self.__Ws1[i, k] + inactive,
                 name=f"safetimeday1_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
-                self.__W[i, k] - task_time[k] + safe_time_to_base[i] <= self.__TTime[0],
-                binvar=self.__Ws1[i, k],
-                activeone=True,
-                name=f"safetimeday1_indicator_constr0[{i},{k}]",
+            self.__m.addConstr(
+                self.__W[i, k] - task_time[k] + safe_time_to_base[i]
+                <= self.__TTime[0] + M * (1 - self.__Ws1[i, k]) + inactive,
+                name=f"safetimeday1_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k]
                 >= self.__W[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Ws3[i, k]),
+                - M * (1 - self.__Ws3[i, k])
+                - inactive,
                 name=f"safetimeday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k]
-                <= self.__W[*self.__opoint[2]] + M * self.__Ws3[i, k],
+                <= self.__W[*self.__opoint[2]] + M * self.__Ws3[i, k] + inactive,
                 name=f"safetimeday3_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
+            self.__m.addConstr(
                 self.__W[i, k]
                 - self.__W[*self.__opoint[2]]
                 - task_time[k]
                 + safe_time_to_base[i]
-                <= self.__TTime[2],
-                binvar=self.__Ws3[i, k],
-                activeone=True,
-                name=f"safetimeday3_indicator_constr0[{i},{k}]",
+                <= self.__TTime[2] + M * (1 - self.__Ws3[i, k]) + inactive,
+                name=f"safetimeday3_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 1
                 >= self.__Ws1[i, k]
                 + self.__Ws3[i, k]
                 + eps
-                - M * (1 - self.__Ws2[i, k]),
+                - M * (1 - self.__Ws2[i, k])
+                - inactive,
                 name=f"safetimeday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
-                <= self.__Ws1[i, k] + self.__Ws3[i, k] + M * self.__Ws2[i, k],
+                <= self.__Ws1[i, k]
+                + self.__Ws3[i, k]
+                + M * self.__Ws2[i, k]
+                + inactive,
                 name=f"safetimeday2_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
+            self.__m.addConstr(
                 self.__W[i, k]
                 - self.__W[*self.__opoint[1]]
                 - task_time[k]
                 + safe_time_to_base[i]
-                <= self.__TTime[1],
-                binvar=self.__Ws2[i, k],
-                activeone=True,
-                name=f"safetimeday2_indicator_constr0[{i},{k}]",
+                <= self.__TTime[1] + M * (1 - self.__Ws2[i, k]) + inactive,
+                name=f"safetimeday2_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                >= self.__Q[i, k] + eps - M * (1 - self.__Qs1[i, k]),
+                >= self.__Q[i, k] + eps - M * (1 - self.__Qs1[i, k]) - inactive,
                 name=f"safepowerday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                <= self.__Q[i, k] + M * self.__Qs1[i, k],
+                <= self.__Q[i, k] + M * self.__Qs1[i, k] + inactive,
                 name=f"safepowerday1_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
-                self.__Q[i, k] - task_power[k] + safe_power_from_base[i] <= self.__TPower[0],
-                binvar=self.__Qs1[i, k],
-                activeone=True,
-                name=f"safepowerday1_indicator_constr0[{i},{k}]",
+            self.__m.addConstr(
+                self.__Q[i, k] - task_power[k] + safe_power_from_base[i]
+                <= self.__TPower[0] + M * (1 - self.__Qs1[i, k]) + inactive,
+                name=f"safepowerday1_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k]
                 >= self.__Q[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Qs3[i, k]),
+                - M * (1 - self.__Qs3[i, k])
+                - inactive,
                 name=f"safepowerday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k]
-                <= self.__Q[*self.__opoint[2]] + M * self.__Qs3[i, k],
+                <= self.__Q[*self.__opoint[2]] + M * self.__Qs3[i, k] + inactive,
                 name=f"safepowerday3_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
+            self.__m.addConstr(
                 self.__Q[i, k]
                 - self.__Q[*self.__opoint[2]]
                 - task_power[k]
                 + safe_power_from_base[i]
-                <= self.__TPower[2],
-                binvar=self.__Qs3[i, k],
-                activeone=True,
-                name=f"safepowerday3_indicator_constr0[{i},{k}]",
+                <= self.__TPower[2] + M * (1 - self.__Qs3[i, k]) + inactive,
+                name=f"safepowerday3_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 1
                 >= self.__Qs1[i, k]
                 + self.__Qs3[i, k]
                 + eps
-                - M * (1 - self.__Qs2[i, k]),
+                - M * (1 - self.__Qs2[i, k])
+                - inactive,
                 name=f"safepowerday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
-                <= self.__Qs1[i, k] + self.__Qs3[i, k] + M * self.__Qs2[i, k],
+                <= self.__Qs1[i, k]
+                + self.__Qs3[i, k]
+                + M * self.__Qs2[i, k]
+                + inactive,
                 name=f"safepowerday2_bigM_constr1[{i},{k}]",
             )
-            self.__m.addConsIndicator(
+            self.__m.addConstr(
                 self.__Q[i, k]
                 - self.__Q[*self.__opoint[1]]
                 - task_power[k]
                 + safe_power_from_base[i]
-                <= self.__TPower[1],
-                binvar=self.__Qs2[i, k],
-                activeone=True,
-                name=f"safepowerday2_indicator_constr0[{i},{k}]",
+                <= self.__TPower[1] + M * (1 - self.__Qs2[i, k]) + inactive,
+                name=f"safepowerday2_constr[{i},{k}]",
             )
         return None
 
@@ -1494,6 +1493,12 @@ class task_optimize(object):
             csv_path = os.path.splitext(path)[0] + ".csv"
             self.__plandf.to_csv(csv_path, index=False)
             self.__objvalue = obj_value
+            self.__print_solution_summary(
+                f"incumbent sol={self.__solcount}",
+                self.__plandf,
+                obj_value=obj_value,
+                path=path,
+            )
             print(
                 f"[eao] INCUMBENT sol={self.__solcount} time={self.__m.getSolvingTime():.3f}s "
                 f"obj={obj_value} xlsx={path} csv={csv_path}",
@@ -1518,10 +1523,6 @@ class task_optimize(object):
         point_name_by_no = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
         task_time = self.__task.set_index("No")["time"].to_dict()
         task_power = self.__task.set_index("No")["power"].to_dict()
-        required_remote_exists = bool(
-            self.__task[(self.__task["remote"] == True) & (self.__task["required"] == True)].shape[0]
-        )
-        remote_selected = False
         continuous_selected = 0
         depot_by_day = {
             1: self.__opoint[0][0],
@@ -1563,10 +1564,6 @@ class task_optimize(object):
 
             task_index = task_by_name[action]
             task_row = self.__task.loc[task_index]
-            if bool(task_row["remote"]):
-                if not bool(task_row["required"]) and (required_remote_exists or remote_selected):
-                    continue
-                remote_selected = True
             if bool(task_row["continuous"]) and not bool(task_row["required"]):
                 if continuous_selected >= self.__Mincontinuous:
                     continue
@@ -1662,6 +1659,220 @@ class task_optimize(object):
             return value
         return None
 
+    def __schedule_summary(self, schedule_df):
+        task_by_name = {
+            str(row["name"]).strip(): row
+            for _, row in self.__task.iterrows()
+            if not str(row["name"]).startswith("void")
+        }
+        package_names = {str(name).strip() for name in self.__package["name"].values}
+        day = 0
+        totals = [[0.0, 0.0] for _ in range(3)]
+        task_count = 0
+        remote_count = 0
+        for _, row in schedule_df.iterrows():
+            action = row.get("action")
+            if pd.isna(action):
+                continue
+            action = str(action).strip()
+            if action == "Begin of Day1":
+                day = 0
+                continue
+            if action == "Break between Day1 and Day2":
+                day = 1
+                continue
+            if action == "Break between Day2 and Day3":
+                day = 2
+                continue
+            if action == "End of Day3":
+                continue
+            if day not in {0, 1, 2}:
+                continue
+            row_time = pd.to_numeric(row.get("time"), errors="coerce")
+            row_power = pd.to_numeric(row.get("power"), errors="coerce")
+            if pd.notna(row_time):
+                totals[day][0] += float(row_time)
+            if pd.notna(row_power):
+                totals[day][1] += float(row_power)
+            if (
+                action not in package_names
+                and not action.startswith("Travel from")
+                and not action.startswith("Wait for")
+                and action not in {"xxx"}
+                and action in task_by_name
+            ):
+                task_count += 1
+                if bool(task_by_name[action]["remote"]):
+                    remote_count += 1
+
+        day_time = ",".join(f"{value[0]:.5f}" for value in totals)
+        day_power = ",".join(f"{value[1]:.5f}" for value in totals)
+        return f"tasks={task_count} remote={remote_count} day_time={day_time} day_power={day_power}"
+
+    def __print_solution_summary(self, label, schedule_df, obj_value=None, path=None):
+        if obj_value is None:
+            obj_value = self.__schedule_objective_value(schedule_df)
+        obj_text = "unknown" if obj_value is None else f"{obj_value}"
+        path_text = "" if path is None else f" schedule={path}"
+        print(
+            f"[eao] SOLUTION {label} obj={obj_text} "
+            f"{self.__schedule_summary(schedule_df)}{path_text}",
+            flush=True,
+        )
+
+    def __validate_business_schedule(self, schedule_df, label="schedule"):
+        if not hasattr(self, "_task_optimize__RawTTime"):
+            return True
+        task_by_name = {
+            str(row["name"]).strip(): row
+            for _, row in self.__task.iterrows()
+            if not str(row["name"]).startswith("void")
+        }
+        package_names = {str(name).strip() for name in self.__package["name"].values}
+        day = 0
+        totals = [[0.0, 0.0] for _ in range(3)]
+        task_entries = [[] for _ in range(3)]
+        remote_count = 0
+        for _, row in schedule_df.iterrows():
+            action = row.get("action")
+            if pd.isna(action):
+                continue
+            action = str(action).strip()
+            if action == "Begin of Day1":
+                day = 0
+                continue
+            if action == "Break between Day1 and Day2":
+                day = 1
+                continue
+            if action == "Break between Day2 and Day3":
+                day = 2
+                continue
+            if action == "End of Day3":
+                continue
+            if day not in {0, 1, 2}:
+                continue
+            row_time = pd.to_numeric(row.get("time"), errors="coerce")
+            row_power = pd.to_numeric(row.get("power"), errors="coerce")
+            if pd.notna(row_time):
+                totals[day][0] += float(row_time)
+            if pd.notna(row_power):
+                totals[day][1] += float(row_power)
+            if (
+                action not in package_names
+                and not action.startswith("Travel from")
+                and not action.startswith("Wait for")
+                and action not in {"xxx"}
+                and action in task_by_name
+            ):
+                tag = task_by_name[action]["tag"]
+                tag = None if pd.isna(tag) else str(tag).strip()
+                task_entries[day].append((action, tag))
+                if bool(task_by_name[action]["remote"]):
+                    remote_count += 1
+
+        violations = []
+        for idx, (used_time, used_power) in enumerate(totals):
+            if used_time > self.__RawTTime[idx] + 1e-6:
+                violations.append(
+                    f"day{idx + 1}_time={used_time:.6f}>{self.__RawTTime[idx]:.6f}"
+                )
+            if used_power > self.__RawTPower[idx] + 1e-6:
+                violations.append(
+                    f"day{idx + 1}_power={used_power:.6f}>{self.__RawTPower[idx]:.6f}"
+                )
+        if self.__remtaskindex and remote_count < 1:
+            violations.append("remote_count=0<1")
+
+        tag_days = {"12s": [], "12e": [], "23s": [], "23e": []}
+        for idx, entries in enumerate(task_entries):
+            for pos, (_, tag) in enumerate(entries):
+                if tag not in tag_days:
+                    continue
+                tag_days[tag].append(idx)
+                if tag in {"12s", "12e"} and idx not in {0, 1}:
+                    violations.append(f"{tag}_invalid_day={idx + 1}")
+                if tag in {"23s", "23e"} and idx not in {1, 2}:
+                    violations.append(f"{tag}_invalid_day={idx + 1}")
+                if tag in {"12s", "23s"} and pos != 0:
+                    violations.append(f"{tag}_not_day_start=day{idx + 1}")
+                if tag in {"12e", "23e"} and pos != len(entries) - 1:
+                    violations.append(f"{tag}_not_day_end=day{idx + 1}")
+
+        for start_tag, end_tag in [("12s", "12e"), ("23s", "23e")]:
+            if tag_days[start_tag] and tag_days[end_tag] and tag_days[start_tag] != tag_days[end_tag]:
+                violations.append(
+                    f"{start_tag}_{end_tag}_not_same_day={tag_days[start_tag]}!={tag_days[end_tag]}"
+                )
+        if set(tag_days["12s"]) & set(tag_days["23s"]):
+            violations.append("12s_23s_same_day")
+        if set(tag_days["12e"]) & set(tag_days["23e"]):
+            violations.append("12e_23e_same_day")
+
+        day_time = ",".join(f"{value[0]:.5f}" for value in totals)
+        day_power = ",".join(f"{value[1]:.5f}" for value in totals)
+        if violations:
+            print(
+                f"[eao] VALIDATE {label} failed day_time={day_time} day_power={day_power} "
+                f"violations={';'.join(violations)}",
+                flush=True,
+            )
+            return False
+        print(
+            f"[eao] VALIDATE {label} ok day_time={day_time} day_power={day_power}",
+            flush=True,
+        )
+        return True
+
+    def validate_schedule(self):
+        if not self.__validate_business_schedule(self.__plandf, "output"):
+            raise MIPError("Output schedule violates business validation rules")
+        return None
+
+    def __make_start_solution(self, selected_edges, w_values, q_values):
+        w_safe1, w_safe2, w_safe3 = self.__safe_binary_values(w_values)
+        q_safe1, q_safe2, q_safe3 = self.__safe_binary_values(q_values)
+
+        sol = self.__m.createSol()
+        for key, var in self.__x.items():
+            self.__m.setSolVal(sol, var, 1.0 if key in selected_edges else 0.0)
+        for key, var in self.__W.items():
+            self.__m.setSolVal(sol, var, w_values.get(key, 0.0))
+        for key, var in self.__Q.items():
+            self.__m.setSolVal(sol, var, q_values.get(key, 0.0))
+        for key, var in self.__Ws1.items():
+            self.__m.setSolVal(sol, var, w_safe1[key])
+        for key, var in self.__Ws2.items():
+            self.__m.setSolVal(sol, var, w_safe2[key])
+        for key, var in self.__Ws3.items():
+            self.__m.setSolVal(sol, var, w_safe3[key])
+        for key, var in self.__Qs1.items():
+            self.__m.setSolVal(sol, var, q_safe1[key])
+        for key, var in self.__Qs2.items():
+            self.__m.setSolVal(sol, var, q_safe2[key])
+        for key, var in self.__Qs3.items():
+            self.__m.setSolVal(sol, var, q_safe3[key])
+        return sol
+
+    def __try_warmstart_schedule(self, schedule_df, label, printreason, path=None):
+        selected_edges, w_values, q_values, selected_nodes = self.__route_values_from_schedule(
+            schedule_df
+        )
+        sol = self.__make_start_solution(selected_edges, w_values, q_values)
+        accepted = self.__m.trySol(sol, printreason=printreason)
+        print(
+            f"[eao] WARMSTART {label} accepted={accepted} "
+            f"selected_edges={len(selected_edges)} selected_nodes={len(selected_nodes)}",
+            flush=True,
+        )
+        if accepted:
+            self.__print_solution_summary(
+                f"warmstart {label}",
+                schedule_df,
+                obj_value=self.__schedule_objective_value(schedule_df),
+                path=path,
+            )
+        return accepted
+
     def build_heuristic_start(self):
         if not self.__dataframes or len(self.__edges) < 1000:
             print("[eao] WARMSTART skipped", flush=True)
@@ -1693,38 +1904,10 @@ class task_optimize(object):
         ha_schedule.to_csv(ha_path, index=False)
         print(f"[eao] WARMSTART ha_schedule={ha_path}", flush=True)
 
-        selected_edges, w_values, q_values, selected_nodes = self.__route_values_from_schedule(
-            ha_schedule
-        )
-
-        w_safe1, w_safe2, w_safe3 = self.__safe_binary_values(w_values)
-        q_safe1, q_safe2, q_safe3 = self.__safe_binary_values(q_values)
-
-        sol = self.__m.createSol()
-        for key, var in self.__x.items():
-            self.__m.setSolVal(sol, var, 1.0 if key in selected_edges else 0.0)
-        for key, var in self.__W.items():
-            self.__m.setSolVal(sol, var, w_values.get(key, 0.0))
-        for key, var in self.__Q.items():
-            self.__m.setSolVal(sol, var, q_values.get(key, 0.0))
-        for key, var in self.__Ws1.items():
-            self.__m.setSolVal(sol, var, w_safe1[key])
-        for key, var in self.__Ws2.items():
-            self.__m.setSolVal(sol, var, w_safe2[key])
-        for key, var in self.__Ws3.items():
-            self.__m.setSolVal(sol, var, w_safe3[key])
-        for key, var in self.__Qs1.items():
-            self.__m.setSolVal(sol, var, q_safe1[key])
-        for key, var in self.__Qs2.items():
-            self.__m.setSolVal(sol, var, q_safe2[key])
-        for key, var in self.__Qs3.items():
-            self.__m.setSolVal(sol, var, q_safe3[key])
-
-        accepted = self.__m.trySol(sol)
-        print(
-            f"[eao] WARMSTART accepted={accepted} selected_edges={len(selected_edges)} selected_nodes={len(selected_nodes)}",
-            flush=True,
-        )
+        if not self.__validate_business_schedule(ha_schedule, "ha_warmstart"):
+            print("[eao] WARMSTART skipped because HA schedule failed business validation", flush=True)
+            return None
+        self.__try_warmstart_schedule(ha_schedule, "ha", printreason=False, path=ha_path)
         return None
 
     def run_opt(self):
@@ -1733,11 +1916,48 @@ class task_optimize(object):
         else:
             self.__m.update()
         self.__m.printStats()
-        if self.__autosavestate:
-            self.__m.includeBestSolHandler(self)
-            self.__m.optimize()
-        else:
-            self.__m.optimize()
+        interrupted = {"value": False}
+
+        def stop_scip(signum, frame):
+            interrupted["value"] = True
+            print(
+                "[eao] INTERRUPT Ctrl+C received; stopping SCIP and keeping current incumbent...",
+                flush=True,
+            )
+            try:
+                self.__m.interruptSolve()
+            except Exception as exc:
+                print(
+                    f"[eao] INTERRUPT failed to request SCIP stop: {exc.__class__.__name__}: {exc}",
+                    flush=True,
+                )
+
+        old_sigint_handler = None
+        install_sigint_handler = threading.current_thread() is threading.main_thread()
+        if install_sigint_handler:
+            old_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, stop_scip)
+        try:
+            if self.__autosavestate:
+                self.__m.includeBestSolHandler(self)
+            try:
+                self.__m.optimize()
+            except KeyboardInterrupt:
+                interrupted["value"] = True
+                try:
+                    self.__m.interruptSolve()
+                except Exception:
+                    pass
+        finally:
+            if install_sigint_handler:
+                signal.signal(signal.SIGINT, old_sigint_handler)
+        if interrupted["value"] or self.__m.Status == _ScipStatus.USER_INTERRUPT:
+            obj_text = "none" if self.__m.objVal is None else self.__m.objVal
+            print(
+                f"[eao] INTERRUPT stopped status={self.__m.Status} "
+                f"sol_count={self.__m.SolCount} obj={obj_text}",
+                flush=True,
+            )
         if self.__m.SolCount >= 1:
             self.__objvalue = self.__m.objVal
         if self.__m.Status == gp.GRB.INFEASIBLE:
@@ -2400,6 +2620,7 @@ class task_optimize(object):
             ("proc_res", self.proc_res),
             ("cal_route", self.cal_route),
             ("add_package", self.add_package),
+            ("validate_schedule", self.validate_schedule),
         ]
         if self.__write_output:
             steps.append(("write_excel", self.write_excel))
