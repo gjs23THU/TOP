@@ -1,4 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
 .DS_Store
@@ -13,3 +13,4 @@ top-algorithm-service-1.0.tar
 
 algorithm_service/__pycache__/
 unified_framework/__pycache__/
+**/*.tar

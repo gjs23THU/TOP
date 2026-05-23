@@ -1,4 +1,4 @@
-# Instance1 Docker 算法矩阵测试计划
+﻿# Instance1 Docker 算法矩阵测试计划
 
 ## 1. 测试目标
 
@@ -51,7 +51,7 @@ docker run -d \
   --name top-algorithm-service \
   -p 8000:8000 \
   -v top_algorithm_runs:/data/runs \
-  top-algorithm-service:1.0
+  top-algorithm-service:latest
 ```
 
 3. 健康检查通过：

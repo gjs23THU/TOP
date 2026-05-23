@@ -1,9 +1,9 @@
 {
   "case_id": "instance1",
   "algorithm": {
-    "name": "pso",
+    "name": "ga",
     "mode": "normal",
-    "obj": "maxRevenue",
+    "obj": "minPower",
     "timeLimit": null,
     "decimal": 5,
     "random_seed": null

@@ -1,4 +1,4 @@
-.venv
+﻿.venv
 .git
 .vscode
 .DS_Store
@@ -9,3 +9,5 @@ unified_framework/.git
 unified_framework/.vscode
 unified_framework/inputs
 unified_framework/infeasible.ilp
+*.tar
+**/*.tar

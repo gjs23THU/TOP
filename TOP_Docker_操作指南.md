@@ -2,16 +2,16 @@
 
 ## 1. 交付文件
 
-- `top-algorithm-service-1.0.tar`
+- `top-algorithm-service.tar`
 
-当前镜像架构为 `linux/arm64`，适用于 Apple Silicon Mac 或 ARM64 Linux。若部署环境是 x86_64/amd64 Linux 服务器，需要提供 amd64 版本镜像。
+当前镜像为 Windows 11 Docker Desktop 构建导出的版本，导入和启动时请使用 `top-algorithm-service.tar` 和 `top-algorithm-service:latest`。
 
 ## 2. 导入镜像
 
 在拿到 tar 文件的机器上执行：
 
 ```bash
-docker load -i top-algorithm-service-1.0.tar
+docker load -i top-algorithm-service.tar
 ```
 
 确认镜像已导入：
@@ -27,7 +27,7 @@ docker run -d \
   --name top-algorithm-service \
   -p 8000:8000 \
   -v top_algorithm_runs:/data/runs \
-  top-algorithm-service:1.0
+  top-algorithm-service:latest
 ```
 
 说明：
