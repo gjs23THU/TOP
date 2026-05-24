@@ -1,7 +1,7 @@
 {
   "case_id": "instance1",
   "algorithm": {
-    "name": "eao",
+    "name": "eah",
     "mode": "normal",
     "obj": "maxRevenue",
     "timeLimit": null,

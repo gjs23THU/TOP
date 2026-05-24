@@ -12,6 +12,7 @@ solver path no longer calls the legacy Excel-based `model.py` or
 - `ha.py`: greedy heuristic solver.
 - `ea.py`: Gurobi-based exact assignment solver.
 - `eao.py`: SCIP/PySCIPOpt-based exact assignment solver.
+- `eah.py`: HiGHS/highspy-based exact assignment solver.
 - `ga.py`: genetic algorithm solver.
 - `router.py`: selects the solver from `config.algorithm.name`.
 - `inputs/instance*`: normalized sample cases.
@@ -20,6 +21,7 @@ solver path no longer calls the legacy Excel-based `model.py` or
 
 - `ea`: implemented.
 - `eao`: implemented.
+- `eah`: implemented.
 - `ha`: implemented.
 - `ga`: implemented.
 - `pso`, `sa`: implemented.

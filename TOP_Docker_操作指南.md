@@ -146,5 +146,6 @@ docker rm top-algorithm-service
 - `ha`、`ga`、`sa`、`pso` 可直接试用。
 - `ea` 是 Gurobi 精确算法，部署环境需要可用的 Gurobi 授权。
 - `eao` 是 SCIP/PySCIPOpt 精确算法，部署环境需要安装 `pyscipopt`。
+- `eah` 是 HiGHS/highspy 精确算法，部署环境需要安装 `highspy`。
 - 默认单个上传文件大小上限为 200MB。
 - 若宿主机 8000 端口被占用，可改成 `-p 8080:8000`，访问地址相应改为 `http://127.0.0.1:8080`。

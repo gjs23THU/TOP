@@ -7,6 +7,21 @@ from typing import Any
 import pandas as pd
 
 
+def exact_big_m(
+    resource_bound: float,
+    extra_cost: float = 0.0,
+    task_cost: float = 0.0,
+    eps: float = 0.0,
+) -> float:
+    return max(
+        1.0 + float(eps),
+        float(resource_bound)
+        + max(0.0, float(extra_cost))
+        + max(0.0, -float(task_cost))
+        + float(eps),
+    )
+
+
 @dataclass(frozen=True)
 class AlgorithmConfig:
     name: str

@@ -27,6 +27,10 @@ def _dispatch(case) -> SchedulePlan:
         from . import eao
 
         return eao.solve(case, mode)
+    elif algorithm == "eah":
+        from . import eah
+
+        return eah.solve(case, mode)
     elif algorithm == "ga":
         from . import ga
 

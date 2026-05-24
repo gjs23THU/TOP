@@ -95,7 +95,7 @@ def _load_config(case_dir: Path) -> CaseConfig:
         if _to_none(algorithm_raw.get("random_seed")) is None
         else int(algorithm_raw["random_seed"]),
     )
-    if algorithm.name not in {"ea", "eao", "ha", "ga", "sa", "pso", "ai"}:
+    if algorithm.name not in {"ea", "eao", "eah", "ha", "ga", "sa", "pso", "ai"}:
         raise ValueError(f"Unsupported algorithm.name: {algorithm.name}")
     if algorithm.mode not in {"normal", "revisional", "back"}:
         raise ValueError(f"Unsupported algorithm.mode: {algorithm.mode}")

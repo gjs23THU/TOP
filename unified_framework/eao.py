@@ -6,11 +6,14 @@ Created on Tue Apr  2 14:53:23 2024
 """
 import os
 import signal
+import contextlib
+import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
+from itertools import product
 import numpy as np
 import pandas as pd
-from itertools import product
 from openpyxl.styles import PatternFill
 from pyscipopt import (
     Eventhdlr,
@@ -21,7 +24,7 @@ from pyscipopt import (
     quicksum,
 )
 
-from .models import MIPError, SubtourError
+from .models import MIPError, SubtourError, exact_big_m
 
 
 class _ScipStatus:
@@ -97,9 +100,174 @@ def _match_pattern(value, pattern):
     return value == pattern
 
 
+def _coerce_positive_int(value, default):
+    if value is None:
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _coerce_int(value, default):
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_parallel_workers(requested):
+    requested = (
+        requested
+        if requested is not None
+        else os.environ.get("TOP_EAO_PARALLEL_WORKERS")
+        or os.environ.get("TOP_EAO_WORKERS")
+    )
+    workers = _coerce_positive_int(requested, None)
+    if workers is None:
+        workers = min(os.cpu_count() or 1, 8)
+    return max(1, workers)
+
+
+def _resolve_parallel_edge_threshold():
+    return _coerce_positive_int(
+        os.environ.get("TOP_EAO_PARALLEL_EDGE_THRESHOLD"),
+        20000,
+    )
+
+
+def _split_evenly(items, part_count):
+    if not items:
+        return []
+    part_count = max(1, min(part_count, len(items)))
+    base_size, remainder = divmod(len(items), part_count)
+    chunks = []
+    start = 0
+    for chunk_index in range(part_count):
+        size = base_size + (1 if chunk_index < remainder else 0)
+        chunks.append(items[start : start + size])
+        start += size
+    return chunks
+
+
+def _build_edge_batch(args):
+    (
+        sources,
+        points,
+        opoints,
+        stage_ranges,
+        point_name_by_no,
+        task_time_by_no,
+        task_power_by_no,
+        time_matrix,
+        power_matrix,
+    ) = args
+    opoint_rank = {point: index for index, point in enumerate(opoints)}
+    first_opoint = opoints[0]
+    last_opoint = opoints[-1]
+    edges = []
+    edge_time_cost = {}
+    edge_power_cost = {}
+
+    for source in sources:
+        if source == last_opoint:
+            continue
+        source_point, source_task = source
+        source_min, source_max = stage_ranges[source_task]
+        source_is_void = source in opoint_rank
+        source_rank = opoint_rank.get(source)
+        source_name = point_name_by_no[source_point]
+
+        for target in points:
+            if source == target or target == first_opoint:
+                continue
+            target_point, target_task = target
+            if source_task == target_task:
+                continue
+
+            target_is_void = target in opoint_rank
+            if source_is_void and target_is_void:
+                is_allowed = opoint_rank[target] == source_rank + 1
+            else:
+                target_min, target_max = stage_ranges[target_task]
+                if source_is_void:
+                    is_allowed = target_max >= source_min
+                elif target_is_void:
+                    is_allowed = source_min <= target_min - 1 <= source_max
+                else:
+                    is_allowed = source_min <= target_max
+
+            if not is_allowed:
+                continue
+
+            edge = (source_point, source_task, target_point, target_task)
+            target_name = point_name_by_no[target_point]
+            edges.append(edge)
+            edge_time_cost[edge] = (
+                float(time_matrix[source_name][target_name])
+                + float(task_time_by_no[target_task])
+            )
+            edge_power_cost[edge] = (
+                float(power_matrix[source_name][target_name])
+                + float(task_power_by_no[target_task])
+            )
+
+    return edges, edge_time_cost, edge_power_cost
+
+
+_SOPLEX_UNSUPPORTED_SETTING_MESSAGES = (
+    "barrier convergence tolerance cannot be set",
+    "fastmip setting not available",
+    "number of threads settings not available",
+)
+
+
+class _ScipOutputFilter:
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer = ""
+
+    def write(self, text):
+        self._buffer += str(text)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._write_line(line + "\n")
+        return len(text)
+
+    def flush(self):
+        if self._buffer:
+            self._write_line(self._buffer)
+            self._buffer = ""
+        return self._stream.flush()
+
+    def _write_line(self, line):
+        if any(message in line for message in _SOPLEX_UNSUPPORTED_SETTING_MESSAGES):
+            return
+        return self._stream.write(line)
+
+
 class _ScipParams:
-    def __init__(self, model):
+    def __init__(self, model, owner):
         object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_owner", owner)
 
     def __setattr__(self, name, value):
         model = object.__getattribute__(self, "_model")
@@ -107,9 +275,36 @@ class _ScipParams:
             model.setParam("limits/time", float(value))
         elif name == "SolutionLimit":
             model.setParam("limits/solutions", int(value))
+        elif name == "Threads":
+            threads = max(1, int(value))
+            try:
+                model.setParam("parallel/mode", 1)
+            except Exception:
+                pass
+            for param_name in (
+                "parallel/maxnthreads",
+                "parallel/minnthreads",
+            ):
+                try:
+                    model.setParam(param_name, threads)
+                except Exception:
+                    pass
         elif name in {"MIPFocus", "Heuristics"}:
             # Gurobi-specific tuning parameters have no direct SCIP equivalent here.
             return
+        elif name == "OutputFlag":
+            model.setParam("display/verblevel", 5 if _coerce_bool(value, False) else 0)
+        elif name == "DisplayVerbLevel":
+            model.setParam("display/verblevel", _coerce_int(value, 5))
+        elif name == "MipLogInterval":
+            model.setParam("display/freq", _coerce_int(value, 100))
+        elif name == "Concurrent":
+            object.__getattribute__(self, "_owner").use_concurrent = _coerce_bool(value, False)
+        elif name == "SuppressUnsupportedLpWarnings":
+            object.__getattribute__(self, "_owner").suppress_unsupported_lp_warnings = _coerce_bool(
+                value,
+                True,
+            )
         else:
             object.__setattr__(self, name, value)
 
@@ -120,24 +315,31 @@ class _ScipModel:
         self._model.setParam("display/verblevel", 0)
         self._model.setEmphasis(SCIP_PARAMEMPHASIS.FEASIBILITY)
         self._model.setHeuristics(SCIP_PARAMSETTING.AGGRESSIVE)
-        self.Params = _ScipParams(self._model)
+        self.Params = _ScipParams(self._model, self)
         self.Status = None
         self.SolCount = 0
         self.objVal = None
         self._event_handlers = []
+        self.use_concurrent = False
+        self.suppress_unsupported_lp_warnings = True
+        self._model.redirectOutput()
 
-    def addVars(self, keys, vtype="C", name=""):
+    def addVars(self, keys, vtype="C", name="", ub=None):
         key_list = [tuple(key) for key in keys]
         arity = len(key_list[0]) if key_list else 0
         variables = _VarDict(arity)
+        upper = None if ub is None else float(ub)
         for key_tuple in key_list:
             suffix = ",".join(str(part) for part in key_tuple)
+            kwargs = {
+                "vtype": vtype,
+                "name": f"{name}[{suffix}]" if name else "",
+            }
+            if upper is not None:
+                kwargs["ub"] = upper
             variables.add(
                 key_tuple,
-                self._model.addVar(
-                    vtype=vtype,
-                    name=f"{name}[{suffix}]" if name else "",
-                ),
+                self._model.addVar(**kwargs),
             )
         return variables
 
@@ -172,12 +374,22 @@ class _ScipModel:
 
     def optimize(self, callback=None):
         try:
-            self._model.optimize()
+            if self.suppress_unsupported_lp_warnings:
+                with contextlib.redirect_stdout(_ScipOutputFilter(sys.stdout)):
+                    self._optimize_impl()
+            else:
+                self._optimize_impl()
         finally:
             self.Status = self._model.getStatus()
             self.SolCount = self._model.getNSols()
             if self.SolCount >= 1:
                 self.objVal = self._model.getObjVal()
+
+    def _optimize_impl(self):
+        if self.use_concurrent:
+            self._model.solveConcurrent()
+        else:
+            self._model.optimize()
 
     def interruptSolve(self):
         return self._model.interruptSolve()
@@ -303,12 +515,49 @@ class task_optimize(object):
         outputPath="schedule.xlsx",
         dataFrames=None,
         writeOutput=True,
+        parallelWorkers=None,
+        scipLog=True,
+        scipLogFreq=100,
+        scipIndicators=False,
+        scipConcurrent=False,
     ):
-        self.__bigM = 10**5
         self.__objective = obj
         self.__Obj = [CONST.MAX_REVENUE, CONST.MIN_TIME, CONST.MIN_POWER]
         self.__time_limit = None if timeLimit == np.inf else timeLimit
+        self.__parallel_workers = _resolve_parallel_workers(parallelWorkers)
+        self.__parallel_edge_threshold = _resolve_parallel_edge_threshold()
+        self.__edge_generation_mode = "serial"
+        self.__edge_generation_workers = 1
+        self.__edge_time_cost = {}
+        self.__edge_power_cost = {}
+        self.__time_upper_bound = None
+        self.__power_upper_bound = None
+        self.__scip_log = _coerce_bool(
+            scipLog if scipLog is not None else os.environ.get("TOP_EAO_SCIP_LOG"),
+            True,
+        )
+        self.__scip_log_freq = _coerce_positive_int(
+            scipLogFreq if scipLogFreq is not None else os.environ.get("TOP_EAO_SCIP_LOG_FREQ"),
+            100,
+        )
+        self.__scip_indicators = _coerce_bool(
+            scipIndicators
+            if scipIndicators is not None
+            else os.environ.get("TOP_EAO_SCIP_INDICATORS"),
+            False,
+        )
+        self.__scip_concurrent = _coerce_bool(
+            scipConcurrent
+            if scipConcurrent is not None
+            else os.environ.get("TOP_EAO_SCIP_CONCURRENT"),
+            False,
+        )
         self.__m = gp.Model("schedule-optimization")
+        self.__m.Params.OutputFlag = self.__scip_log
+        if self.__scip_log:
+            self.__m.Params.MipLogInterval = self.__scip_log_freq
+        self.__m.Params.Threads = self.__parallel_workers
+        self.__m.Params.Concurrent = self.__scip_concurrent
         if timeLimit != np.inf:
             self.__m.Params.TimeLimit = timeLimit
         if solNum != np.inf:
@@ -798,24 +1047,116 @@ class task_optimize(object):
             return source_min <= target_min - 1 <= source_max
         return source_min <= target_max
 
+    def __edge_batch_args(self, source_chunks, stage_ranges):
+        pointdfbackup = self.__pointdf.copy()
+        pointdfbackup.reset_index(inplace=True)
+        pointdfbackup.set_index("No", inplace=True)
+        taskbackup = self.__task.copy()
+        taskbackup.reset_index(inplace=True)
+        taskbackup.set_index("No", inplace=True)
+        point_name_by_no = pointdfbackup["index"].to_dict()
+        task_time_by_no = taskbackup["time"].to_dict()
+        task_power_by_no = taskbackup["power"].to_dict()
+        time_matrix = self.__tmatrix.to_dict(orient="index")
+        power_matrix = self.__pmatrix.to_dict(orient="index")
+        points = list(self.__point)
+        opoints = tuple(self.__opoint)
+        return [
+            (
+                source_chunk,
+                points,
+                opoints,
+                stage_ranges,
+                point_name_by_no,
+                task_time_by_no,
+                task_power_by_no,
+                time_matrix,
+                power_matrix,
+            )
+            for source_chunk in source_chunks
+        ]
+
+    def __load_edge_batches(self, batches):
+        edges = gp.tuplelist()
+        edge_time_cost = {}
+        edge_power_cost = {}
+        for batch_edges, batch_time_cost, batch_power_cost in batches:
+            edges.extend(batch_edges)
+            edge_time_cost.update(batch_time_cost)
+            edge_power_cost.update(batch_power_cost)
+        self.__edges = edges
+        self.__edge_time_cost = edge_time_cost
+        self.__edge_power_cost = edge_power_cost
+
+    def __resource_upper_bound(self, budgets):
+        values = [float(value) for value in budgets if np.isfinite(float(value))]
+        if not values:
+            return 0.0
+        return max(0.0, sum(values))
+
+    def __time_bound(self):
+        if self.__time_upper_bound is None:
+            self.__time_upper_bound = self.__resource_upper_bound(self.__TTime)
+        return self.__time_upper_bound
+
+    def __power_bound(self):
+        if self.__power_upper_bound is None:
+            self.__power_upper_bound = self.__resource_upper_bound(self.__TPower)
+        return self.__power_upper_bound
+
     def gen_edges(self):
         stage_ranges = {
             task_index: self.__task_stage_range(task_index)
             for task_index in self.__task.index
         }
-        self.__edges = gp.tuplelist()
-        for source in self.__point:
-            for target in self.__point:
-                if self.__edge_is_allowed(source, target, stage_ranges):
-                    self.__edges.append((*source, *target))
+        points = list(self.__point)
+        pair_count = len(points) * len(points)
+        worker_count = min(self.__parallel_workers, len(points))
+        use_parallel = (
+            worker_count > 1
+            and pair_count >= self.__parallel_edge_threshold
+        )
+        chunks = _split_evenly(points, worker_count if use_parallel else 1)
+        args = self.__edge_batch_args(chunks, stage_ranges)
+        self.__edge_generation_mode = "serial"
+        self.__edge_generation_workers = 1
+
+        if use_parallel:
+            try:
+                with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                    batches = list(executor.map(_build_edge_batch, args))
+                self.__edge_generation_mode = "parallel"
+                self.__edge_generation_workers = worker_count
+            except Exception as exc:
+                print(
+                    "[eao] PARALLEL gen_edges failed; falling back to serial "
+                    f"error={exc.__class__.__name__}: {exc}",
+                    flush=True,
+                )
+                args = self.__edge_batch_args([points], stage_ranges)
+                batches = [_build_edge_batch(args[0])]
+        else:
+            batches = [_build_edge_batch(args[0])] if args else []
+
+        self.__load_edge_batches(batches)
         return None
 
     def add_variables(self):
         edges = self.__edges
         point = self.__point
         self.__x = self.__m.addVars(edges, vtype=gp.GRB.BINARY, name="x")
-        self.__W = self.__m.addVars(point, vtype=gp.GRB.CONTINUOUS, name="W")
-        self.__Q = self.__m.addVars(point, vtype=gp.GRB.CONTINUOUS, name="Q")
+        self.__W = self.__m.addVars(
+            point,
+            vtype=gp.GRB.CONTINUOUS,
+            name="W",
+            ub=self.__time_bound(),
+        )
+        self.__Q = self.__m.addVars(
+            point,
+            vtype=gp.GRB.CONTINUOUS,
+            name="Q",
+            ub=self.__power_bound(),
+        )
         self.__Ws1 = self.__m.addVars(
             point, vtype=gp.GRB.BINARY, name="Wsafe1"
         )
@@ -838,19 +1179,47 @@ class task_optimize(object):
 
     def set_objective(self):
         taskdf = self.__task
-        expr = []
         if self.__objective == self.__Obj[0]:
-            for t in taskdf.index.values:
-                expr.append(
-                    self.__x.sum("*", "*", "*", t) * taskdf["revenue"][t]
-                )
-        if self.__objective == self.__Obj[1]:
-            expr.append(-self.__W[*self.__opoint[-1]])
-        if self.__objective == self.__Obj[2]:
-            expr.append(-self.__Q[*self.__opoint[-1]])
-        expr = gp.quicksum(expr)
+            revenue = taskdf["revenue"].to_dict()
+            expr = gp.quicksum(
+                var * float(revenue[t])
+                for (_, _, _, t), var in self.__x.items()
+                if float(revenue[t]) != 0.0
+            )
+        elif self.__objective == self.__Obj[1]:
+            expr = -self.__W[*self.__opoint[-1]]
+        elif self.__objective == self.__Obj[2]:
+            expr = -self.__Q[*self.__opoint[-1]]
+        else:
+            expr = gp.quicksum([])
         self.__m.setObjective(expr, gp.GRB.MAXIMIZE)
         return expr
+
+    def __add_indicator_constrs(self, constrs, name):
+        for idx, (cons, binvar) in enumerate(constrs):
+            self.__m.addConsIndicator(
+                cons,
+                binvar=binvar,
+                activeone=True,
+                name=f"{name}[{idx}]",
+            )
+        return None
+
+    def __add_transition_indicator_constrs(self, resource_vars, edge_cost, name):
+        self.__add_indicator_constrs(
+            (
+                (
+                    resource_vars[i, a]
+                    + edge_cost[i, a, j, b]
+                    - resource_vars[j, b]
+                    <= 0,
+                    self.__x[i, a, j, b],
+                )
+                for i, a, j, b in self.__edges
+            ),
+            name,
+        )
+        return None
 
     def add_indegree_constrs(self):
         temp = gp.tuplelist(self.__point.copy())
@@ -968,29 +1337,29 @@ class task_optimize(object):
 
     def add_time_constrs(self):
         point = gp.tuplelist(self.__point.copy())
+        time_bound = self.__time_bound()
         temp = [self.__opoint[0]]
         self.__m.addConstrs(
             (self.__W.sum(i, k) == 0 for i, k in temp), name="time0"
         )
-        pointdfbackup = self.__pointdf.copy()
-        pointdfbackup.reset_index(inplace=True)
-        pointdfbackup.set_index("No", inplace=True)
-        taskbackup = self.__task.copy()
-        taskbackup.reset_index(inplace=True)
-        taskbackup.set_index("No", inplace=True)
-        self.__m.addConstrs(
-            (
-                self.__W[i, a]
-                + self.__tmatrix.loc[pointdfbackup.loc[i, "index"]][
-                    pointdfbackup.loc[j, "index"]
-                ]
-                + taskbackup.loc[b, "time"]
-                - self.__W[j, b]
-                <= self.__bigM * (1 - self.__x[i, a, j, b])
-                for i, a, j, b in self.__edges
-            ),
-            name="time1",
-        )
+        if self.__scip_indicators:
+            self.__add_transition_indicator_constrs(
+                self.__W,
+                self.__edge_time_cost,
+                "time1_indicator",
+            )
+        else:
+            self.__m.addConstrs(
+                (
+                    self.__W[i, a]
+                    + self.__edge_time_cost[i, a, j, b]
+                    - self.__W[j, b]
+                    <= exact_big_m(time_bound, self.__edge_time_cost[i, a, j, b])
+                    * (1 - self.__x[i, a, j, b])
+                    for i, a, j, b in self.__edges
+                ),
+                name="time1",
+            )
         self.__m.addConstr(
             self.__W[*self.__opoint[1]] <= self.__TTime[0],
             name="time2",
@@ -1204,29 +1573,29 @@ class task_optimize(object):
 
     def add_power_constrs(self):
         point = gp.tuplelist(self.__point.copy())
+        power_bound = self.__power_bound()
         temp = [self.__opoint[0]]
         self.__m.addConstrs(
             (self.__Q.sum(i, k) == 0 for i, k in temp), name="power0"
         )
-        pointdfbackup = self.__pointdf.copy()
-        pointdfbackup.reset_index(inplace=True)
-        pointdfbackup.set_index("No", inplace=True)
-        taskbackup = self.__task.copy()
-        taskbackup.reset_index(inplace=True)
-        taskbackup.set_index("No", inplace=True)
-        self.__m.addConstrs(
-            (
-                self.__Q[i, a]
-                + self.__pmatrix.loc[pointdfbackup.loc[i, "index"]][
-                    pointdfbackup.loc[j, "index"]
-                ]
-                + taskbackup.loc[b, "power"]
-                - self.__Q[j, b]
-                <= self.__bigM * (1 - self.__x[i, a, j, b])
-                for i, a, j, b in self.__edges
-            ),
-            name="power1",
-        )
+        if self.__scip_indicators:
+            self.__add_transition_indicator_constrs(
+                self.__Q,
+                self.__edge_power_cost,
+                "power1_indicator",
+            )
+        else:
+            self.__m.addConstrs(
+                (
+                    self.__Q[i, a]
+                    + self.__edge_power_cost[i, a, j, b]
+                    - self.__Q[j, b]
+                    <= exact_big_m(power_bound, self.__edge_power_cost[i, a, j, b])
+                    * (1 - self.__x[i, a, j, b])
+                    for i, a, j, b in self.__edges
+                ),
+                name="power1",
+            )
         self.__m.addConstr(
             self.__Q[*self.__opoint[1]] <= self.__TPower[0],
             name="power2",
@@ -1271,7 +1640,8 @@ class task_optimize(object):
     def add_safe_constrs(self):
         point = gp.tuplelist(self.__point.copy())
         eps = 0.0001
-        M = self.__bigM + eps
+        time_bound = self.__time_bound()
+        power_bound = self.__power_bound()
         task_time = self.__task.set_index("No")["time"].to_dict()
         task_power = self.__task.set_index("No")["power"].to_dict()
         point_name = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
@@ -1285,33 +1655,41 @@ class task_optimize(object):
             if (i, k) in self.__opoint:
                 continue
             selected = self.__x.sum("*", "*", i, k)
-            inactive = M * (1 - selected)
+            time_m = exact_big_m(time_bound, safe_time_to_base[i], task_time[k], eps)
+            power_m = exact_big_m(power_bound, safe_power_from_base[i], task_power[k], eps)
+            inactive_time = time_m * (1 - selected)
+            inactive_power = power_m * (1 - selected)
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                >= self.__W[i, k] + eps - M * (1 - self.__Ws1[i, k]) - inactive,
+                >= self.__W[i, k]
+                + eps
+                - time_m * (1 - self.__Ws1[i, k])
+                - inactive_time,
                 name=f"safetimeday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                <= self.__W[i, k] + M * self.__Ws1[i, k] + inactive,
+                <= self.__W[i, k] + time_m * self.__Ws1[i, k] + inactive_time,
                 name=f"safetimeday1_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k] - task_time[k] + safe_time_to_base[i]
-                <= self.__TTime[0] + M * (1 - self.__Ws1[i, k]) + inactive,
+                <= self.__TTime[0]
+                + time_m * (1 - self.__Ws1[i, k])
+                + inactive_time,
                 name=f"safetimeday1_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k]
                 >= self.__W[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Ws3[i, k])
-                - inactive,
+                - time_m * (1 - self.__Ws3[i, k])
+                - inactive_time,
                 name=f"safetimeday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k]
-                <= self.__W[*self.__opoint[2]] + M * self.__Ws3[i, k] + inactive,
+                <= self.__W[*self.__opoint[2]] + time_m * self.__Ws3[i, k] + inactive_time,
                 name=f"safetimeday3_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1319,7 +1697,9 @@ class task_optimize(object):
                 - self.__W[*self.__opoint[2]]
                 - task_time[k]
                 + safe_time_to_base[i]
-                <= self.__TTime[2] + M * (1 - self.__Ws3[i, k]) + inactive,
+                <= self.__TTime[2]
+                + time_m * (1 - self.__Ws3[i, k])
+                + inactive_time,
                 name=f"safetimeday3_constr[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1327,16 +1707,16 @@ class task_optimize(object):
                 >= self.__Ws1[i, k]
                 + self.__Ws3[i, k]
                 + eps
-                - M * (1 - self.__Ws2[i, k])
-                - inactive,
+                - time_m * (1 - self.__Ws2[i, k])
+                - inactive_time,
                 name=f"safetimeday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
                 <= self.__Ws1[i, k]
                 + self.__Ws3[i, k]
-                + M * self.__Ws2[i, k]
-                + inactive,
+                + time_m * self.__Ws2[i, k]
+                + inactive_time,
                 name=f"safetimeday2_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1344,35 +1724,42 @@ class task_optimize(object):
                 - self.__W[*self.__opoint[1]]
                 - task_time[k]
                 + safe_time_to_base[i]
-                <= self.__TTime[1] + M * (1 - self.__Ws2[i, k]) + inactive,
+                <= self.__TTime[1]
+                + time_m * (1 - self.__Ws2[i, k])
+                + inactive_time,
                 name=f"safetimeday2_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                >= self.__Q[i, k] + eps - M * (1 - self.__Qs1[i, k]) - inactive,
+                >= self.__Q[i, k]
+                + eps
+                - power_m * (1 - self.__Qs1[i, k])
+                - inactive_power,
                 name=f"safepowerday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                <= self.__Q[i, k] + M * self.__Qs1[i, k] + inactive,
+                <= self.__Q[i, k] + power_m * self.__Qs1[i, k] + inactive_power,
                 name=f"safepowerday1_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k] - task_power[k] + safe_power_from_base[i]
-                <= self.__TPower[0] + M * (1 - self.__Qs1[i, k]) + inactive,
+                <= self.__TPower[0]
+                + power_m * (1 - self.__Qs1[i, k])
+                + inactive_power,
                 name=f"safepowerday1_constr[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k]
                 >= self.__Q[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Qs3[i, k])
-                - inactive,
+                - power_m * (1 - self.__Qs3[i, k])
+                - inactive_power,
                 name=f"safepowerday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k]
-                <= self.__Q[*self.__opoint[2]] + M * self.__Qs3[i, k] + inactive,
+                <= self.__Q[*self.__opoint[2]] + power_m * self.__Qs3[i, k] + inactive_power,
                 name=f"safepowerday3_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1380,7 +1767,9 @@ class task_optimize(object):
                 - self.__Q[*self.__opoint[2]]
                 - task_power[k]
                 + safe_power_from_base[i]
-                <= self.__TPower[2] + M * (1 - self.__Qs3[i, k]) + inactive,
+                <= self.__TPower[2]
+                + power_m * (1 - self.__Qs3[i, k])
+                + inactive_power,
                 name=f"safepowerday3_constr[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1388,16 +1777,16 @@ class task_optimize(object):
                 >= self.__Qs1[i, k]
                 + self.__Qs3[i, k]
                 + eps
-                - M * (1 - self.__Qs2[i, k])
-                - inactive,
+                - power_m * (1 - self.__Qs2[i, k])
+                - inactive_power,
                 name=f"safepowerday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
                 <= self.__Qs1[i, k]
                 + self.__Qs3[i, k]
-                + M * self.__Qs2[i, k]
-                + inactive,
+                + power_m * self.__Qs2[i, k]
+                + inactive_power,
                 name=f"safepowerday2_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1405,7 +1794,9 @@ class task_optimize(object):
                 - self.__Q[*self.__opoint[1]]
                 - task_power[k]
                 + safe_power_from_base[i]
-                <= self.__TPower[1] + M * (1 - self.__Qs2[i, k]) + inactive,
+                <= self.__TPower[1]
+                + power_m * (1 - self.__Qs2[i, k])
+                + inactive_power,
                 name=f"safepowerday2_constr[{i},{k}]",
             )
         return None
@@ -1832,7 +2223,7 @@ class task_optimize(object):
         w_safe1, w_safe2, w_safe3 = self.__safe_binary_values(w_values)
         q_safe1, q_safe2, q_safe3 = self.__safe_binary_values(q_values)
 
-        sol = self.__m.createSol()
+        sol = self.__m.createPartialSol()
         for key, var in self.__x.items():
             self.__m.setSolVal(sol, var, 1.0 if key in selected_edges else 0.0)
         for key, var in self.__W.items():
@@ -2552,7 +2943,10 @@ class task_optimize(object):
         if step == "gen_point":
             return f"points={len(self.__point)}"
         if step == "gen_edges":
-            return f"edges={len(self.__edges)}"
+            return (
+                f"edges={len(self.__edges)} mode={self.__edge_generation_mode} "
+                f"workers={self.__edge_generation_workers}"
+            )
         if step == "add_variables":
             return (
                 f"x={len(self.__x)} W={len(self.__W)} Q={len(self.__Q)} "
@@ -2583,7 +2977,9 @@ class task_optimize(object):
 
     def run(self):
         print(
-            f"[eao] RUN start objective={self.__objective} timeLimit={self.__time_limit}",
+            f"[eao] RUN start objective={self.__objective} timeLimit={self.__time_limit} "
+            f"parallelWorkers={self.__parallel_workers} scipLog={self.__scip_log} "
+            f"scipIndicators={self.__scip_indicators} scipConcurrent={self.__scip_concurrent}",
             flush=True,
         )
         total_started = time.perf_counter()
@@ -2668,6 +3064,41 @@ def solve(case, mode="normal"):
     }
     if case.config.algorithm.time_limit is not None:
         kwargs["timeLimit"] = case.config.algorithm.time_limit
+    algorithm_raw = case.config.raw.get("algorithm", {})
+    parallel_workers = (
+        algorithm_raw.get("parallelWorkers")
+        or algorithm_raw.get("workers")
+        or algorithm_raw.get("threads")
+    )
+    if parallel_workers is not None:
+        kwargs["parallelWorkers"] = parallel_workers
+    algorithm_raw = case.config.raw.get("algorithm", {})
+    scip_log = (
+        algorithm_raw.get("scipLog")
+        if "scipLog" in algorithm_raw
+        else algorithm_raw.get("scip_log")
+        if "scip_log" in algorithm_raw
+        else algorithm_raw.get("log")
+    )
+    if scip_log is not None:
+        kwargs["scipLog"] = scip_log
+    scip_log_freq = algorithm_raw.get("scipLogFreq") or algorithm_raw.get("scip_log_freq")
+    if scip_log_freq is not None:
+        kwargs["scipLogFreq"] = scip_log_freq
+    scip_indicators = (
+        algorithm_raw.get("scipIndicators")
+        if "scipIndicators" in algorithm_raw
+        else algorithm_raw.get("scip_indicators")
+    )
+    if scip_indicators is not None:
+        kwargs["scipIndicators"] = scip_indicators
+    scip_concurrent = (
+        algorithm_raw.get("scipConcurrent")
+        if "scipConcurrent" in algorithm_raw
+        else algorithm_raw.get("scip_concurrent")
+    )
+    if scip_concurrent is not None:
+        kwargs["scipConcurrent"] = scip_concurrent
     optimizer = task_optimize(**kwargs)
     optimizer.run()
     schedule_df = optimizer.schedule_frame()

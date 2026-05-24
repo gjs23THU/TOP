@@ -14,3 +14,13 @@ top-algorithm-service-1.0.tar
 algorithm_service/__pycache__/
 unified_framework/__pycache__/
 **/*.tar
+
+# Temporary run artifacts
+tmp_*/
+tmp*/
+temp/
+temp_*/
+*/tmp_*/
+*/tmp*/
+*/temp/
+*/temp_*/

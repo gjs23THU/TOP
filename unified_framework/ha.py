@@ -114,7 +114,7 @@ class heuristic_normal(object):
     def read_task(self):
         task=self.__dataframes.get('task')
         self.__task=task.copy() if task is not None else pd.read_excel(self.__taskPath)
-        print(self.__task.head())
+        # print(self.__task.head())
         self.__task['No']=range(self.__task.shape[0])
         self.__dmatrix=self.__read_matrix(self.__distancepath,'distance')
         self.__dmatrix.replace(np.inf,self.__MDistance*3,inplace=True)
@@ -166,8 +166,8 @@ class heuristic_normal(object):
         self.__dmatrix=self.__add_void_matrix(self.__dmatrix)
         self.__tmatrix=self.__add_void_matrix(self.__tmatrix)
         self.__pmatrix=self.__add_void_matrix(self.__pmatrix)
-        self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4',inplace=True)
-        self.__task['location'].replace(np.nan,','.join(self.__pointdf.index.values),inplace=True)
+        self.__task['location']=self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4')
+        self.__task['location']=self.__task['location'].fillna(','.join(self.__pointdf.index.values))
         location=self.__task['location'].values
         pool=[]
         for i in location:
@@ -889,8 +889,8 @@ class heuristic_revisional(object):
         self.__dmatrix=self.__add_void_matrix(self.__dmatrix)
         self.__tmatrix=self.__add_void_matrix(self.__tmatrix)
         self.__pmatrix=self.__add_void_matrix(self.__pmatrix)
-        self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4',inplace=True)
-        self.__task['location'].replace(np.nan,','.join(self.__pointdf.index.values),inplace=True)
+        self.__task['location']=self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4')
+        self.__task['location']=self.__task['location'].fillna(','.join(self.__pointdf.index.values))
         location=self.__task['location'].values
         pool=[]
         for i in location:
@@ -1781,8 +1781,8 @@ class heuristic_back(object):
         self.__dmatrix=self.__add_void_matrix(self.__dmatrix)
         self.__tmatrix=self.__add_void_matrix(self.__tmatrix)
         self.__pmatrix=self.__add_void_matrix(self.__pmatrix)
-        self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4',inplace=True)
-        self.__task['location'].replace(np.nan,','.join(self.__pointdf.index.values),inplace=True)
+        self.__task['location']=self.__task['location'].replace('探测起点','探测起点1,探测起点2,探测起点3,探测起点4')
+        self.__task['location']=self.__task['location'].fillna(','.join(self.__pointdf.index.values))
         location=self.__task['location'].values
         pool=[]
         for i in location:

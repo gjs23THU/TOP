@@ -12,7 +12,7 @@ import pandas as pd
 from itertools import product
 from openpyxl.styles import PatternFill
 
-from .models import MIPError, SubtourError
+from .models import MIPError, SubtourError, exact_big_m
 
 
 class CONST(object):
@@ -54,7 +54,6 @@ class task_optimize(object):
         dataFrames=None,
         writeOutput=True,
     ):
-        self.__bigM = 10**5
         self.__objective = obj
         self.__Obj = [CONST.MAX_REVENUE, CONST.MIN_TIME, CONST.MIN_POWER]
         self.__m = gp.Model("schedule-optimization")
@@ -84,6 +83,8 @@ class task_optimize(object):
         self.__dataframes = dataFrames or {}
         self.__write_output = writeOutput
         self.__solcount = 1
+        self.__time_upper_bound = None
+        self.__power_upper_bound = None
         return None
 
     def test_IO(self):
@@ -492,12 +493,38 @@ class task_optimize(object):
                 self.__edges.append((*i, *j))
         return None
 
+    def __resource_upper_bound(self, budgets):
+        values = [float(value) for value in budgets if np.isfinite(float(value))]
+        if not values:
+            return 0.0
+        return max(0.0, sum(values))
+
+    def __time_bound(self):
+        if self.__time_upper_bound is None:
+            self.__time_upper_bound = self.__resource_upper_bound(self.__TTime)
+        return self.__time_upper_bound
+
+    def __power_bound(self):
+        if self.__power_upper_bound is None:
+            self.__power_upper_bound = self.__resource_upper_bound(self.__TPower)
+        return self.__power_upper_bound
+
     def add_variables(self):
         edges = self.__edges
         point = self.__point
         self.__x = self.__m.addVars(edges, vtype=gp.GRB.BINARY, name="x")
-        self.__W = self.__m.addVars(point, vtype=gp.GRB.CONTINUOUS, name="W")
-        self.__Q = self.__m.addVars(point, vtype=gp.GRB.CONTINUOUS, name="Q")
+        self.__W = self.__m.addVars(
+            point,
+            vtype=gp.GRB.CONTINUOUS,
+            name="W",
+            ub=self.__time_bound(),
+        )
+        self.__Q = self.__m.addVars(
+            point,
+            vtype=gp.GRB.CONTINUOUS,
+            name="Q",
+            ub=self.__power_bound(),
+        )
         self.__Ws1 = self.__m.addVars(
             point, vtype=gp.GRB.BINARY, name="Wsafe1"
         )
@@ -638,6 +665,7 @@ class task_optimize(object):
 
     def add_time_constrs(self):
         point = gp.tuplelist(self.__point.copy())
+        time_bound = self.__time_bound()
         temp = [self.__opoint[0]]
         self.__m.addConstrs(
             (self.__W.sum(i, k) == 0 for i, k in temp), name="time0"
@@ -656,7 +684,14 @@ class task_optimize(object):
                 ]
                 + taskbackup.loc[b, "time"]
                 - self.__W[j, b]
-                <= self.__bigM * (1 - self.__x[i, a, j, b])
+                <= exact_big_m(
+                    time_bound,
+                    self.__tmatrix.loc[pointdfbackup.loc[i, "index"]][
+                        pointdfbackup.loc[j, "index"]
+                    ]
+                    + taskbackup.loc[b, "time"],
+                )
+                * (1 - self.__x[i, a, j, b])
                 for i, a, j, b in self.__edges
             ),
             name="time1",
@@ -881,6 +916,7 @@ class task_optimize(object):
 
     def add_power_constrs(self):
         point = gp.tuplelist(self.__point.copy())
+        power_bound = self.__power_bound()
         temp = [self.__opoint[0]]
         self.__m.addConstrs(
             (self.__Q.sum(i, k) == 0 for i, k in temp), name="power0"
@@ -899,7 +935,14 @@ class task_optimize(object):
                 ]
                 + taskbackup.loc[b, "power"]
                 - self.__Q[j, b]
-                <= self.__bigM * (1 - self.__x[i, a, j, b])
+                <= exact_big_m(
+                    power_bound,
+                    self.__pmatrix.loc[pointdfbackup.loc[i, "index"]][
+                        pointdfbackup.loc[j, "index"]
+                    ]
+                    + taskbackup.loc[b, "power"],
+                )
+                * (1 - self.__x[i, a, j, b])
                 for i, a, j, b in self.__edges
             ),
             name="power1",
@@ -955,7 +998,8 @@ class task_optimize(object):
     def add_safe_constrs(self):
         point = gp.tuplelist(self.__point.copy())
         eps = 0.0001
-        M = self.__bigM + eps
+        time_bound = self.__time_bound()
+        power_bound = self.__power_bound()
         task_time = self.__task.set_index("No")["time"].to_dict()
         task_power = self.__task.set_index("No")["power"].to_dict()
         point_name = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
@@ -966,14 +1010,16 @@ class task_optimize(object):
             i: self.__pmatrix.loc["探测起点1", name] for i, name in point_name.items()
         }
         for i, k in point:
+            time_m = exact_big_m(time_bound, safe_time_to_base[i], task_time[k], eps)
+            power_m = exact_big_m(power_bound, safe_power_from_base[i], task_power[k], eps)
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                >= self.__W[i, k] + eps - M * (1 - self.__Ws1[i, k]),
+                >= self.__W[i, k] + eps - time_m * (1 - self.__Ws1[i, k]),
                 name=f"safetimeday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[*self.__opoint[1]]
-                <= self.__W[i, k] + M * self.__Ws1[i, k],
+                <= self.__W[i, k] + time_m * self.__Ws1[i, k],
                 name=f"safetimeday1_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -990,12 +1036,12 @@ class task_optimize(object):
                 self.__W[i, k]
                 >= self.__W[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Ws3[i, k]),
+                - time_m * (1 - self.__Ws3[i, k]),
                 name=f"safetimeday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__W[i, k]
-                <= self.__W[*self.__opoint[2]] + M * self.__Ws3[i, k],
+                <= self.__W[*self.__opoint[2]] + time_m * self.__Ws3[i, k],
                 name=f"safetimeday3_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1014,12 +1060,12 @@ class task_optimize(object):
                 >= self.__Ws1[i, k]
                 + self.__Ws3[i, k]
                 + eps
-                - M * (1 - self.__Ws2[i, k]),
+                - time_m * (1 - self.__Ws2[i, k]),
                 name=f"safetimeday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
-                <= self.__Ws1[i, k] + self.__Ws3[i, k] + M * self.__Ws2[i, k],
+                <= self.__Ws1[i, k] + self.__Ws3[i, k] + time_m * self.__Ws2[i, k],
                 name=f"safetimeday2_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1035,12 +1081,12 @@ class task_optimize(object):
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                >= self.__Q[i, k] + eps - M * (1 - self.__Qs1[i, k]),
+                >= self.__Q[i, k] + eps - power_m * (1 - self.__Qs1[i, k]),
                 name=f"safepowerday1_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[*self.__opoint[1]]
-                <= self.__Q[i, k] + M * self.__Qs1[i, k],
+                <= self.__Q[i, k] + power_m * self.__Qs1[i, k],
                 name=f"safepowerday1_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1057,12 +1103,12 @@ class task_optimize(object):
                 self.__Q[i, k]
                 >= self.__Q[*self.__opoint[2]]
                 + eps
-                - M * (1 - self.__Qs3[i, k]),
+                - power_m * (1 - self.__Qs3[i, k]),
                 name=f"safepowerday3_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 self.__Q[i, k]
-                <= self.__Q[*self.__opoint[2]] + M * self.__Qs3[i, k],
+                <= self.__Q[*self.__opoint[2]] + power_m * self.__Qs3[i, k],
                 name=f"safepowerday3_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(
@@ -1081,12 +1127,12 @@ class task_optimize(object):
                 >= self.__Qs1[i, k]
                 + self.__Qs3[i, k]
                 + eps
-                - M * (1 - self.__Qs2[i, k]),
+                - power_m * (1 - self.__Qs2[i, k]),
                 name=f"safepowerday2_bigM_constr0[{i},{k}]",
             )
             self.__m.addConstr(
                 1
-                <= self.__Qs1[i, k] + self.__Qs3[i, k] + M * self.__Qs2[i, k],
+                <= self.__Qs1[i, k] + self.__Qs3[i, k] + power_m * self.__Qs2[i, k],
                 name=f"safepowerday2_bigM_constr1[{i},{k}]",
             )
             self.__m.addConstr(

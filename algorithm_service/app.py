@@ -88,7 +88,7 @@ def create_app(
     @app.get("/api/v1/algorithms")
     def algorithms() -> dict[str, list[str]]:
         return {
-            "name": ["ea", "eao", "ha", "ga", "sa", "pso", "ai"],
+            "name": ["ea", "eao", "eah", "ha", "ga", "sa", "pso", "ai"],
             "mode": ["normal", "revisional", "back"],
             "objective": ["maxRevenue", "minTime", "minPower"],
         }
