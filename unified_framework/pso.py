@@ -13,9 +13,9 @@ A particle is a continuous random-key vector with four dimensions per real
 task: selection, day, location, and within-day order. The solver updates
 continuous positions and velocities with the canonical PSO equation, then
 decodes the random keys into a complete 3-day route. A repair/validation
-layer enforces the same structural constraints as ea.py: required tasks,
-remote exactly-one, continuous exact-cardinality, day windows, tag boundary
-constraints, time/power budgets, and per-step return safety.
+layer enforces the same structural constraints as ea.py: required tasks, at
+least one far remote location, continuous exact-cardinality, day windows, tag
+boundary constraints, time/power budgets, and per-step return safety.
 
 This avoids any dependency on Gurobi.
 """
@@ -344,12 +344,9 @@ class task_optimize(object):
         remoteindex = self.__task[self.__task["remote"] == True].index.to_list()
         points = []
         for index in remoteindex:
-            pts = []
             for point in self.__task.loc[index, "location"]:
                 if self.__dmatrix.loc["探测起点1", point] >= self.__MDistance:
                     points.append(point)
-                    pts.append(point)
-            self.__task.at[index, "location"] = pts
         if len(points) == 0:
             start = 0
             path = "new-point.xlsx"
@@ -448,6 +445,7 @@ class task_optimize(object):
             (self.__pointdf.loc["探测起点4", "No"],
              self.__task[self.__task["name"] == "void4"].index[0]),
         )
+        self.__point_no_to_name = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
         self.__point = []
         for t in self.__task.index:
             loc = self.__task.loc[t, "location"]
@@ -531,6 +529,23 @@ class task_optimize(object):
 
         self.__real_task_set = set(self.__task_indices)
 
+    def _is_remote_candidate(self, task_idx, location_no):
+        if task_idx not in self.__remtaskindex:
+            return False
+        location_name = self.__point_no_to_name.get(location_no)
+        if location_name is None:
+            return False
+        return self.__dmatrix.loc["探测起点1", location_name] >= self.__MDistance
+
+    def _remote_candidates(self):
+        return [
+            (task_idx, location_no)
+            for task_idx in self.__remtaskindex
+            if task_idx in self.__real_task_set
+            for location_no in self.__task_locs.get(task_idx, [])
+            if self._is_remote_candidate(task_idx, location_no)
+        ]
+
     # -----------------------------------------------------------------------
     # Travel cost helpers
     # -----------------------------------------------------------------------
@@ -576,14 +591,14 @@ class task_optimize(object):
                     locs = self.__task_locs[t]
                     loc_choice[t] = locs[rng.integers(len(locs))]
 
-        # 3. Remote tasks: select exactly one
+        # 3. Remote tasks: seed at least one far remote candidate
         rem_real = [t for t in self.__remtaskindex if t in self.__real_task_set]
         if rem_real:
-            rt = rem_real[rng.integers(len(rem_real))]
+            candidates = self._remote_candidates()
+            rt, far_loc = candidates[rng.integers(len(candidates))]
             selected.add(rt)
             if rt not in loc_choice:
-                locs = self.__task_locs[rt]
-                loc_choice[rt] = locs[rng.integers(len(locs))]
+                loc_choice[rt] = far_loc
 
         # 4. Randomly include some optional tasks
         opt_real = [t for t in self.__opttaskindex
@@ -627,20 +642,18 @@ class task_optimize(object):
                 locs = self.__task_locs[t]
                 loc[t] = locs[rng.integers(len(locs))]
 
-        # --- Remote constraint: exactly one ---
+        # --- Remote constraint: at least one selected far remote location ---
         rem_real = [t for t in self.__remtaskindex if t in self.__real_task_set]
         if rem_real:
-            rem_sel = [t for t in rem_real if t in selected]
-            if len(rem_sel) == 0:
-                rt = rem_real[rng.integers(len(rem_real))]
+            has_far_remote = any(
+                t in selected and self._is_remote_candidate(t, loc.get(t))
+                for t in rem_real
+            )
+            if not has_far_remote:
+                candidates = self._remote_candidates()
+                rt, far_loc = candidates[rng.integers(len(candidates))]
                 selected.add(rt)
-                locs = self.__task_locs[rt]
-                loc[rt] = locs[rng.integers(len(locs))]
-            elif len(rem_sel) > 1:
-                keep = rem_sel[rng.integers(len(rem_sel))]
-                for rt in rem_sel:
-                    if rt != keep and not self.__task_required.get(rt, False):
-                        selected.discard(rt)
+                loc[rt] = far_loc
 
         # --- Continuous constraint: exactly Mincontinuous ---
         cont_real = [t for t in self.__contaskindex if t in self.__real_task_set]
@@ -1011,7 +1024,10 @@ class task_optimize(object):
                 return False
 
         rem_real = [t for t in self.__remtaskindex if t in self.__real_task_set]
-        if rem_real and sum(1 for t in rem_real if t in selected) != 1:
+        if rem_real and not any(
+            t in selected and self._is_remote_candidate(t, loc.get(t))
+            for t in rem_real
+        ):
             return False
 
         cont_real = [t for t in self.__contaskindex if t in self.__real_task_set]
@@ -1193,10 +1209,6 @@ class task_optimize(object):
             t for group in self.__tagtaskindex for t in group
             if t in self.__real_task_set
         )
-        req_remote = [t for t in self.__remtaskindex
-                      if t in self.__real_task_set and self.__task_required.get(t, False)]
-        if len(req_remote) > 1:
-            raise MIPError("Model is infeasible: more than one required remote task")
         req_cont = [t for t in self.__contaskindex
                     if t in self.__real_task_set and self.__task_required.get(t, False)]
         if len(req_cont) > int(self.__Mincontinuous):
@@ -1250,24 +1262,19 @@ class task_optimize(object):
             if select_score[self.__pso_index[t]] >= 0.5:
                 selected.add(t)
 
-        # Remote exactly-one. Required remote wins; otherwise choose highest key.
+        # Remote at-least-one far point. Keep selected remote tasks; add a far one if needed.
         rem_real = [t for t in self.__remtaskindex if t in self.__real_task_set]
-        if rem_real:
-            required_rem = [t for t in rem_real if self.__task_required.get(t, False)]
-            if len(required_rem) > 1:
-                selected.update(required_rem)
-            elif len(required_rem) == 1:
-                keep = required_rem[0]
-                selected.add(keep)
-                for t in rem_real:
-                    if t != keep:
-                        selected.discard(t)
-            else:
-                keep = self._choose_by_key(rem_real, pos["select"], reverse=True)[0]
-                selected.add(keep)
-                for t in rem_real:
-                    if t != keep:
-                        selected.discard(t)
+        if rem_real and not any(
+            t in selected and self._is_remote_candidate(t, loc.get(t))
+            for t in rem_real
+        ):
+            candidates = self._remote_candidates()
+            task_idx, location_no = max(
+                candidates,
+                key=lambda item: pos["select"][self.__pso_index[item[0]]],
+            )
+            selected.add(task_idx)
+            loc[task_idx] = location_no
 
         # Continuous exact-cardinality. Required continuous tasks are fixed.
         cont_real = [t for t in self.__contaskindex if t in self.__real_task_set]
@@ -1349,25 +1356,20 @@ class task_optimize(object):
         sol["days"] = new_days
         days = sol["days"]
 
-        # Re-apply remote and continuous cardinalities after day normalization.
-        # These operations only remove optional tasks; required conflicts remain invalid.
+        # Re-apply remote and continuous requirements after day normalization.
         rem_real = [t for t in self.__remtaskindex if t in self.__real_task_set]
-        if rem_real:
-            required_rem = [t for t in rem_real if self.__task_required.get(t, False)]
-            if len(required_rem) <= 1:
-                if required_rem:
-                    keep = required_rem[0]
-                else:
-                    pool = [t for t in rem_real if t in selected] or rem_real
-                    key = pos["select"] if pos is not None else np.zeros(len(self.__pso_tasks))
-                    keep = self._choose_by_key(pool, key, reverse=True)[0]
-                selected.add(keep)
-                for t in rem_real:
-                    if t != keep and not self.__task_required.get(t, False):
-                        selected.discard(t)
-                        for d in range(3):
-                            if t in days[d]:
-                                days[d].remove(t)
+        if rem_real and not any(
+            t in selected and self._is_remote_candidate(t, loc.get(t))
+            for t in rem_real
+        ):
+            candidates = self._remote_candidates()
+            key = pos["select"] if pos is not None else np.zeros(len(self.__pso_tasks))
+            task_idx, location_no = max(
+                candidates,
+                key=lambda item: key[self.__pso_index[item[0]]],
+            )
+            selected.add(task_idx)
+            loc[task_idx] = location_no
 
         cont_real = [t for t in self.__contaskindex if t in self.__real_task_set]
         if cont_real:

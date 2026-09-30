@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 from .io import load_case, write_error, write_outputs
 from .models import MaxDistanceError, SolveResult
@@ -12,12 +13,17 @@ NOT_IMPLEMENTED = {"ai"}
 
 
 def _dispatch(case) -> SchedulePlan:
-    remote_check = check_remote_requirement(case)
-    if not remote_check.ok:
-        raise MaxDistanceError(remote_check.message or "")
-
     algorithm = case.config.algorithm.name
     mode = case.config.algorithm.mode
+
+    # eac keeps the remote-distance requirement inside the COPT model so an
+    # unsatisfiable remote requirement follows the standard infeasible/IIS
+    # path.  Preserve the established pre-check behavior for all other
+    # algorithms.
+    if algorithm != "eac":
+        remote_check = check_remote_requirement(case)
+        if not remote_check.ok:
+            raise MaxDistanceError(remote_check.message or "")
 
     if algorithm == "ea":
         from . import ea
@@ -31,6 +37,10 @@ def _dispatch(case) -> SchedulePlan:
         from . import eah
 
         return eah.solve(case, mode)
+    elif algorithm == "eac":
+        from . import eac
+
+        return eac.solve(case, mode)
     elif algorithm == "ga":
         from . import ga
 
@@ -62,13 +72,29 @@ def solve_case(case_dir: str | Path) -> SchedulePlan:
 def run_case(case_dir: str | Path) -> SolveResult:
     case_path = Path(case_dir).resolve()
     case_id = case_path.name
+    started = time.perf_counter()
+    algorithm_name = None
     try:
         case = load_case(case_path)
         case_id = case.config.case_id
+        algorithm_name = case.config.algorithm.name
         plan = _dispatch(case)
+        metrics = dict(plan.metrics or {})
+        metrics.setdefault("solver_name", algorithm_name)
+        metrics["total_seconds"] = time.perf_counter() - started
+        plan.metrics = metrics
         return write_outputs(case, plan)
     except Exception as exc:
-        return write_error(case_path, case_id, exc)
+        return write_error(
+            case_path,
+            case_id,
+            exc,
+            metrics={
+                "solver_name": algorithm_name,
+                "termination_status": "solver_error",
+                "total_seconds": time.perf_counter() - started,
+            },
+        )
 
 
 def main() -> int:

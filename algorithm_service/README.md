@@ -11,6 +11,10 @@ implementation:
   `config.json`, `task.csv`, `package.csv`, `point.csv`, `distance.csv`,
   `time.csv`, `power.csv`, `output/result.json`, and `output/schedule.csv`.
 
+The exact solver names are `ea` (Gurobi), `eao` (SCIP), `eah` (HiGHS),
+and `eac` (COPT). COPT is imported only when `eac` is selected, so a missing
+license does not prevent the service or other algorithms from starting.
+
 ## Install service dependencies
 
 ```bash

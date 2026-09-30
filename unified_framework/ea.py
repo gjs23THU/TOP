@@ -7,6 +7,7 @@ Created on Tue Apr  2 14:53:23 2024
 import gurobipy as gp
 import os
 import threading
+import time
 import numpy as np
 import pandas as pd
 from itertools import product
@@ -53,10 +54,14 @@ class task_optimize(object):
         outputPath="schedule.xlsx",
         dataFrames=None,
         writeOutput=True,
+        parallelWorkers=None,
     ):
         self.__objective = obj
         self.__Obj = [CONST.MAX_REVENUE, CONST.MIN_TIME, CONST.MIN_POWER]
+        self.__time_limit = None if timeLimit == np.inf else timeLimit
         self.__m = gp.Model("schedule-optimization")
+        if parallelWorkers is not None:
+            self.__m.Params.Threads = max(1, int(parallelWorkers))
         if timeLimit != np.inf:
             self.__m.Params.TimeLimit = timeLimit
         if solNum != np.inf:
@@ -85,6 +90,10 @@ class task_optimize(object):
         self.__solcount = 1
         self.__time_upper_bound = None
         self.__power_upper_bound = None
+        self.__step_timings = {}
+        self.__run_elapsed = None
+        self.__progress_events = []
+        self.__business_validation_passed = None
         return None
 
     def test_IO(self):
@@ -139,6 +148,8 @@ class task_optimize(object):
         self.__MDistance = info["max-distance"][0]
         self.__TTime = list(map(float, info["total-time/day"][0].split(";")))
         self.__TPower = list(map(float, info["total-power/day"][0].split(";")))
+        self.__RawTTime = list(self.__TTime)
+        self.__RawTPower = list(self.__TPower)
         self.__Mincontinuous = info["min-continuous"][0]
         self.__12gap = info["12-gap"][0]
         self.__23gap = info["23-gap"][0]
@@ -354,12 +365,9 @@ class task_optimize(object):
         ].index.to_list()
         points = []
         for index in remoteindex:
-            pts = []
             for point in self.__task.loc[index, "location"]:
                 if self.__dmatrix.loc["探测起点1", point] >= self.__MDistance:
                     points.append(point)
-                    pts.append(point)
-            self.__task.at[index, "location"] = pts
         if len(points) == 0:
             start = 0
             path = "new-point.xlsx"
@@ -484,13 +492,75 @@ class task_optimize(object):
                     self.__point.append((i, t))
         return self.__point
 
+    def __task_stage_range(self, task_index):
+        if task_index == self.__opoint[0][1]:
+            return 0, 0
+        if task_index == self.__opoint[1][1]:
+            return 1, 1
+        if task_index == self.__opoint[2][1]:
+            return 2, 2
+        if task_index == self.__opoint[3][1]:
+            return 3, 3
+
+        tag = self.__task.loc[task_index, "tag"]
+        if isinstance(tag, str):
+            tag = tag.strip()
+            if tag in {"12s", "12e"}:
+                return 0, 1
+            if tag in {"23s", "23e"}:
+                return 1, 2
+
+        day = self.__task.loc[task_index, "day"]
+        if pd.isna(day):
+            return 0, 2
+        text = str(day).strip()
+        if text.endswith(".0"):
+            text = text[:-2]
+        if text == "1":
+            return 0, 0
+        if text == "2":
+            return 1, 1
+        if text == "3":
+            return 2, 2
+        if text == "1,2":
+            return 0, 1
+        if text == "2,3":
+            return 1, 2
+        return 0, 2
+
+    def __edge_is_allowed(self, source, target, stage_ranges):
+        if source == target:
+            return False
+        _, source_task = source
+        _, target_task = target
+        if source_task == target_task:
+            return False
+        if target == self.__opoint[0] or source == self.__opoint[-1]:
+            return False
+
+        source_is_void = source in self.__opoint
+        target_is_void = target in self.__opoint
+        if source_is_void and target_is_void:
+            return self.__opoint.index(target) == self.__opoint.index(source) + 1
+
+        source_min, source_max = stage_ranges[source_task]
+        target_min, target_max = stage_ranges[target_task]
+        if source_is_void:
+            return target_max >= source_min
+        if target_is_void:
+            return source_min <= target_min - 1 <= source_max
+        return source_min <= target_max
+
     def gen_edges(self):
+        stage_ranges = {
+            task_index: self.__task_stage_range(task_index)
+            for task_index in self.__task.index
+        }
         self.__edges = gp.tuplelist()
         for i in self.__point:
             for j in self.__point:
-                if i == j:
-                    continue
-                self.__edges.append((*i, *j))
+                if self.__edge_is_allowed(i, j, stage_ranges):
+                    self.__edges.append((*i, *j))
         return None
 
     def __resource_upper_bound(self, budgets):
@@ -624,17 +694,29 @@ class task_optimize(object):
         temp = self.__opoint
         temp = temp[:-1]
         self.__m.addConstrs(
-            (self.__x[*self.__opoint[-1], j, k2] == 0 for j, k2 in temp),
+            (
+                self.__x[*self.__opoint[-1], j, k2] == 0
+                for j, k2 in temp
+                if (*self.__opoint[-1], j, k2) in self.__x
+            ),
             name="oodegree4",
         )
         temp = temp[:-1]
         self.__m.addConstrs(
-            (self.__x[*self.__opoint[2], j, k2] == 0 for j, k2 in temp),
+            (
+                self.__x[*self.__opoint[2], j, k2] == 0
+                for j, k2 in temp
+                if (*self.__opoint[2], j, k2) in self.__x
+            ),
             name="oodegree5",
         )
         temp = temp[:-1]
         self.__m.addConstrs(
-            (self.__x[*self.__opoint[1], j, k2] == 0 for j, k2 in temp),
+            (
+                self.__x[*self.__opoint[1], j, k2] == 0
+                for j, k2 in temp
+                if (*self.__opoint[1], j, k2) in self.__x
+            ),
             name="oodegree6",
         )
         return None
@@ -654,11 +736,20 @@ class task_optimize(object):
         return None
 
     def add_remote_constrs(self):
+        if not self.__remtaskindex:
+            return None
+        point_name = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
+        remote_points = [
+            (i, k)
+            for i, k in self.__point
+            if k in self.__remtaskindex
+            and self.__dmatrix.loc["探测起点1", point_name[i]] >= self.__MDistance
+        ]
         self.__m.addConstr(
             gp.quicksum(
-                (self.__x.sum("*", "*", "*", k) for k in self.__remtaskindex)
+                (self.__x.sum("*", "*", i, k) for i, k in remote_points)
             )
-            == 1,
+            >= 1,
             name="remote",
         )
         return None
@@ -1168,8 +1259,33 @@ class task_optimize(object):
         )
         return None
 
+    def __record_progress(self, model):
+        try:
+            elapsed = float(model.cbGet(gp.GRB.Callback.RUNTIME))
+            incumbent = float(model.cbGet(gp.GRB.Callback.MIPSOL_OBJ))
+            best_bound = float(model.cbGet(gp.GRB.Callback.MIPSOL_OBJBND))
+        except Exception:
+            return None
+        absolute_gap = abs(incumbent - best_bound)
+        relative_gap = absolute_gap / max(1.0e-10, abs(incumbent))
+        self.__progress_events.append(
+            {
+                "event": "incumbent",
+                "elapsed_seconds": elapsed,
+                "incumbent_objective": incumbent,
+                "best_bound": best_bound,
+                "absolute_gap": absolute_gap,
+                "relative_gap": relative_gap,
+                "solution_source": "solver",
+            }
+        )
+        return None
+
     def __callback(self, model, where):
         if where == gp.GRB.Callback.MIPSOL:
+            self.__record_progress(model)
+            if not self.__autosavestate:
+                return None
             if self.__outputpath[-5:] == ".xlsx":
                 path = (
                     self.__outputpath[:-5]
@@ -1216,10 +1332,25 @@ class task_optimize(object):
         else:
             self.__m.update()
         self.__m.printStats()
-        if self.__autosavestate:
-            self.__m.optimize(self.__callback)
-        else:
-            self.__m.optimize()
+        self.__m.optimize(self.__callback)
+        incumbent = self.__metric_value("objVal") if self.__m.SolCount >= 1 else None
+        best_bound = self.__metric_value("ObjBound")
+        absolute_gap = (
+            abs(incumbent - best_bound)
+            if incumbent is not None and best_bound is not None
+            else None
+        )
+        self.__progress_events.append(
+            {
+                "event": "final",
+                "elapsed_seconds": self.__metric_value("Runtime"),
+                "incumbent_objective": incumbent,
+                "best_bound": best_bound,
+                "absolute_gap": absolute_gap,
+                "relative_gap": self.__metric_value("MIPGap"),
+                "solution_source": "solver" if incumbent is not None else None,
+            }
+        )
         if self.__m.Status == gp.GRB.INFEASIBLE:
             self.__m.computeIIS()
             self.__m.write("infeasible.ilp")
@@ -1788,40 +1919,304 @@ class task_optimize(object):
     def schedule_frame(self):
         return self.__plandf.copy()
 
+    def __validate_business_schedule(self, schedule_df, label="schedule"):
+        task_by_name = {
+            str(row["name"]).strip(): row
+            for _, row in self.__task.iterrows()
+            if not str(row["name"]).startswith("void")
+        }
+        package_names = {str(name).strip() for name in self.__package["name"].values}
+        day = 0
+        totals = [[0.0, 0.0] for _ in range(3)]
+        task_entries = [[] for _ in range(3)]
+        remote_count = 0
+        for _, row in schedule_df.iterrows():
+            action = row.get("action")
+            if pd.isna(action):
+                continue
+            action = str(action).strip()
+            if action == "Begin of Day1":
+                day = 0
+                continue
+            if action == "Break between Day1 and Day2":
+                day = 1
+                continue
+            if action == "Break between Day2 and Day3":
+                day = 2
+                continue
+            if action == "End of Day3":
+                continue
+            if day not in {0, 1, 2}:
+                continue
+            row_time = pd.to_numeric(row.get("time"), errors="coerce")
+            row_power = pd.to_numeric(row.get("power"), errors="coerce")
+            if pd.notna(row_time):
+                totals[day][0] += float(row_time)
+            if pd.notna(row_power):
+                totals[day][1] += float(row_power)
+            if (
+                action not in package_names
+                and not action.startswith("Travel from")
+                and not action.startswith("Wait for")
+                and action not in {"xxx"}
+                and action in task_by_name
+            ):
+                tag = task_by_name[action]["tag"]
+                tag = None if pd.isna(tag) else str(tag).strip()
+                task_entries[day].append((action, tag))
+                if bool(task_by_name[action]["remote"]):
+                    remote_count += 1
+
+        violations = []
+        for idx, (used_time, used_power) in enumerate(totals):
+            if used_time > self.__RawTTime[idx] + 1e-6:
+                violations.append(
+                    f"day{idx + 1}_time={used_time:.6f}>{self.__RawTTime[idx]:.6f}"
+                )
+            if used_power > self.__RawTPower[idx] + 1e-6:
+                violations.append(
+                    f"day{idx + 1}_power={used_power:.6f}>{self.__RawTPower[idx]:.6f}"
+                )
+        if self.__remtaskindex and remote_count < 1:
+            violations.append("remote_count=0<1")
+
+        tag_days = {"12s": [], "12e": [], "23s": [], "23e": []}
+        for idx, entries in enumerate(task_entries):
+            for pos, (_, tag) in enumerate(entries):
+                if tag not in tag_days:
+                    continue
+                tag_days[tag].append(idx)
+                if tag in {"12s", "12e"} and idx not in {0, 1}:
+                    violations.append(f"{tag}_invalid_day={idx + 1}")
+                if tag in {"23s", "23e"} and idx not in {1, 2}:
+                    violations.append(f"{tag}_invalid_day={idx + 1}")
+                if tag in {"12s", "23s"} and pos != 0:
+                    violations.append(f"{tag}_not_day_start=day{idx + 1}")
+                if tag in {"12e", "23e"} and pos != len(entries) - 1:
+                    violations.append(f"{tag}_not_day_end=day{idx + 1}")
+
+        for start_tag, end_tag in [("12s", "12e"), ("23s", "23e")]:
+            if tag_days[start_tag] and tag_days[end_tag] and tag_days[start_tag] != tag_days[end_tag]:
+                violations.append(
+                    f"{start_tag}_{end_tag}_not_same_day={tag_days[start_tag]}!={tag_days[end_tag]}"
+                )
+        if set(tag_days["12s"]) & set(tag_days["23s"]):
+            violations.append("12s_23s_same_day")
+        if set(tag_days["12e"]) & set(tag_days["23e"]):
+            violations.append("12e_23e_same_day")
+
+        day_time = ",".join(f"{value[0]:.5f}" for value in totals)
+        day_power = ",".join(f"{value[1]:.5f}" for value in totals)
+        if violations:
+            print(
+                f"[ea] VALIDATE {label} failed day_time={day_time} day_power={day_power} "
+                f"violations={';'.join(violations)}",
+                flush=True,
+            )
+            return False
+        print(
+            f"[ea] VALIDATE {label} ok day_time={day_time} day_power={day_power}",
+            flush=True,
+        )
+        return True
+
+    def validate_schedule(self):
+        self.__business_validation_passed = self.__validate_business_schedule(
+            self.__plandf, "output"
+        )
+        if not self.__business_validation_passed:
+            raise MIPError("Output schedule violates business validation rules")
+        return None
+
+    def __metric_value(self, name):
+        try:
+            value = float(getattr(self.__m, name))
+        except Exception:
+            return None
+        return value if np.isfinite(value) else None
+
+    def metrics(self):
+        status_map = {
+            gp.GRB.OPTIMAL: "optimal",
+            gp.GRB.TIME_LIMIT: "time_limit",
+            gp.GRB.INFEASIBLE: "infeasible",
+            gp.GRB.INTERRUPTED: "interrupted",
+        }
+        incumbent = self.__metric_value("objVal") if self.__m.SolCount >= 1 else None
+        best_bound = self.__metric_value("ObjBound")
+        absolute_gap = (
+            abs(incumbent - best_bound)
+            if incumbent is not None and best_bound is not None
+            else None
+        )
+        first_feasible = next(
+            (
+                event["elapsed_seconds"]
+                for event in self.__progress_events
+                if event.get("event") == "incumbent"
+            ),
+            None,
+        )
+        model_steps = {
+            "gen_edges",
+            "add_variables",
+            "set_objective",
+            "add_indegree_constrs",
+            "add_outdegree_constrs",
+            "add_equaldegree_constrs",
+            "add_oodegree_constrs",
+            "add_rtask_constrs",
+            "add_otask_constrs",
+            "add_remote_constrs",
+            "add_time_constrs",
+            "add_day_constrs",
+            "add_power_constrs",
+            "add_safe_constrs",
+            "add_continuous_constr",
+            "add_noii_constrs",
+        }
+        postprocess_steps = {
+            "print_status",
+            "proc_res",
+            "cal_route",
+            "add_package",
+            "validate_schedule",
+            "write_excel",
+        }
+        return {
+            "solver_name": "gurobi",
+            "solver_version": ".".join(str(value) for value in gp.gurobi.version()),
+            "termination_status": status_map.get(self.__m.Status, str(self.__m.Status)),
+            "model_build_seconds": sum(
+                value for key, value in self.__step_timings.items() if key in model_steps
+            ),
+            "solve_seconds": self.__metric_value("Runtime"),
+            "postprocess_seconds": sum(
+                value for key, value in self.__step_timings.items() if key in postprocess_steps
+            ),
+            "algorithm_total_seconds": self.__run_elapsed,
+            "first_feasible_seconds": first_feasible,
+            "first_feasible_observed": first_feasible is not None,
+            "incumbent_objective": incumbent,
+            "best_bound": best_bound,
+            "absolute_gap": absolute_gap,
+            "relative_gap": self.__metric_value("MIPGap"),
+            "node_count": self.__metric_value("NodeCount"),
+            "model_state_count": len(self.__point),
+            "model_edge_count": len(self.__edges),
+            "model_variable_count": sum(
+                len(values)
+                for values in (
+                    self.__x,
+                    self.__W,
+                    self.__Q,
+                    self.__Ws1,
+                    self.__Ws2,
+                    self.__Ws3,
+                    self.__Qs1,
+                    self.__Qs2,
+                    self.__Qs3,
+                )
+            ),
+            "solver_reported_variable_count": int(self.__m.NumVars),
+            "model_constraint_count": int(self.__m.NumConstrs),
+            "model_general_constraint_count": int(self.__m.NumGenConstrs),
+            "time_limit_seconds": None
+            if self.__m.Params.TimeLimit >= gp.GRB.INFINITY
+            else float(self.__m.Params.TimeLimit),
+            "threads": int(self.__m.Params.Threads),
+            "warm_start_enabled": False,
+            "warm_start_accepted": False,
+            "warm_start_source": None,
+            "fallback_used": False,
+            "native_solution_found": self.__m.SolCount >= 1,
+            "business_validation_passed": self.__business_validation_passed,
+            "step_timings": dict(self.__step_timings),
+        }
+
+    def progress_events(self):
+        return [dict(event) for event in self.__progress_events]
+
+    def __log_step_detail(self, step):
+        if step == "gen_edges":
+            return f"edges={len(self.__edges)}"
+        if step == "add_variables":
+            return (
+                f"x={len(self.__x)} W={len(self.__W)} Q={len(self.__Q)} "
+                f"safe_binary={len(self.__Ws1) + len(self.__Ws2) + len(self.__Ws3) + len(self.__Qs1) + len(self.__Qs2) + len(self.__Qs3)}"
+            )
+        if step == "run_opt":
+            return (
+                f"status={self.__m.Status} sol_count={self.__m.SolCount} "
+                f"obj={self.__metric_value('objVal')}"
+            )
+        return ""
+
+    def __run_logged_step(self, index, total, step, func):
+        print(f"[ea] START {index:02d}/{total:02d} {step}", flush=True)
+        started = time.perf_counter()
+        try:
+            result = func()
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            self.__step_timings[step] = elapsed
+            print(
+                f"[ea] FAIL  {index:02d}/{total:02d} {step} elapsed={elapsed:.3f}s "
+                f"error={exc.__class__.__name__}: {exc}",
+                flush=True,
+            )
+            raise
+        elapsed = time.perf_counter() - started
+        self.__step_timings[step] = elapsed
+        detail = self.__log_step_detail(step)
+        suffix = f" {detail}" if detail else ""
+        print(f"[ea] END   {index:02d}/{total:02d} {step} elapsed={elapsed:.3f}s{suffix}", flush=True)
+        return result
+
     def run(self):
-        self.test_IO()
-        self.read_info()
-        self.read_task()
-        self.read_package()
-        self.read_point()
-        self.gen_void_point()
-        self.check_remote()
-        self.divide_task()
-        self.drop_O()
-        self.gen_point()
-        self.gen_edges()
-        self.add_variables()
-        self.set_objective()
-        self.add_indegree_constrs()
-        self.add_outdegree_constrs()
-        self.add_equaldegree_constrs()
-        self.add_oodegree_constrs()
-        self.add_rtask_constrs()
-        self.add_otask_constrs()
-        self.add_remote_constrs()
-        self.add_time_constrs()
-        self.add_day_constrs()
-        self.add_power_constrs()
-        self.add_safe_constrs()
-        self.add_continuous_constr()
-        self.add_noii_constrs()
-        self.run_opt()
-        self.print_status()
-        self.proc_res()
-        self.cal_route()
-        self.add_package()
+        print(f"[ea] RUN start objective={self.__objective}", flush=True)
+        total_started = time.perf_counter()
+        steps = [
+            ("test_IO", self.test_IO),
+            ("read_info", self.read_info),
+            ("read_task", self.read_task),
+            ("read_package", self.read_package),
+            ("read_point", self.read_point),
+            ("gen_void_point", self.gen_void_point),
+            ("check_remote", self.check_remote),
+            ("divide_task", self.divide_task),
+            ("drop_O", self.drop_O),
+            ("gen_point", self.gen_point),
+            ("gen_edges", self.gen_edges),
+            ("add_variables", self.add_variables),
+            ("set_objective", self.set_objective),
+            ("add_indegree_constrs", self.add_indegree_constrs),
+            ("add_outdegree_constrs", self.add_outdegree_constrs),
+            ("add_equaldegree_constrs", self.add_equaldegree_constrs),
+            ("add_oodegree_constrs", self.add_oodegree_constrs),
+            ("add_rtask_constrs", self.add_rtask_constrs),
+            ("add_otask_constrs", self.add_otask_constrs),
+            ("add_remote_constrs", self.add_remote_constrs),
+            ("add_time_constrs", self.add_time_constrs),
+            ("add_day_constrs", self.add_day_constrs),
+            ("add_power_constrs", self.add_power_constrs),
+            ("add_safe_constrs", self.add_safe_constrs),
+            ("add_continuous_constr", self.add_continuous_constr),
+            ("add_noii_constrs", self.add_noii_constrs),
+            ("run_opt", self.run_opt),
+            ("print_status", self.print_status),
+            ("proc_res", self.proc_res),
+            ("cal_route", self.cal_route),
+            ("add_package", self.add_package),
+            ("validate_schedule", self.validate_schedule),
+        ]
         if self.__write_output:
-            self.write_excel()
+            steps.append(("write_excel", self.write_excel))
+        total = len(steps)
+        for index, (step, func) in enumerate(steps, start=1):
+            self.__run_logged_step(index, total, step, func)
+        self.__run_elapsed = time.perf_counter() - total_started
+        print(f"[ea] RUN end elapsed={self.__run_elapsed:.3f}s", flush=True)
         return None
 
 
@@ -1861,6 +2256,14 @@ def solve(case, mode="normal"):
     }
     if case.config.algorithm.time_limit is not None:
         kwargs["timeLimit"] = case.config.algorithm.time_limit
+    algorithm_raw = case.config.raw.get("algorithm", {})
+    parallel_workers = (
+        algorithm_raw.get("parallelWorkers")
+        or algorithm_raw.get("workers")
+        or algorithm_raw.get("threads")
+    )
+    if parallel_workers is not None:
+        kwargs["parallelWorkers"] = parallel_workers
     optimizer = task_optimize(**kwargs)
     optimizer.run()
     schedule_df = optimizer.schedule_frame()
@@ -1872,6 +2275,8 @@ def solve(case, mode="normal"):
         steps=[],
         rows=rows,
         objective_value=None if objective_value is None else float(objective_value),
+        metrics=optimizer.metrics(),
+        progress=optimizer.progress_events(),
     )
 
 

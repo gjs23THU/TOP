@@ -140,3 +140,4 @@ class SolveResult:
     objective_value: float | None
     schedule_path: str | None
     error: dict[str, str] | None = None
+    metrics: dict[str, Any] | None = None

@@ -16,6 +16,7 @@ class SolverResult(BaseModel):
     objective_value: float | None = None
     schedule_path: str | None = None
     error: ErrorInfo | None = None
+    metrics: dict[str, Any] | None = None
 
 
 class SolveResponse(BaseModel):

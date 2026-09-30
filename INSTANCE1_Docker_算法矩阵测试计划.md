@@ -24,6 +24,8 @@
 - `ea`：精确求解，现阶段 ban 掉，避免耗时过长或依赖 Gurobi 授权。
 - `ai`：当前框架中是保留入口，尚未实现，不纳入能力验证。
 
+`eac` 作为带许可证的附加精确算法验证项，不加入默认 12 组测试。挂载有效的 COPT 8.x 许可证后，可单独运行三个目标函数。
+
 目标函数：
 
 - `maxRevenue`
@@ -99,6 +101,14 @@ OUTPUT_DIR=output/my_test ./run_instance1_docker_matrix.sh
 ```bash
 TIME_LIMIT_SECONDS=300 ./run_instance1_docker_matrix.sh
 ```
+
+验证 COPT 且保留算例原始 `timeLimit`（不由测试脚本注入停止时限）：
+
+```bash
+ALGORITHMS=eac PRESERVE_TIME_LIMIT=true ./run_instance1_docker_matrix.sh
+```
+
+运行该命令前，容器必须以只读方式挂载 COPT 8.x 的 `license.dat`、`license.key`，并设置 `COPT_LICENSE_DIR`。
 
 ## 5. 输出文件命名
 

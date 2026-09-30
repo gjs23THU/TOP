@@ -13,6 +13,7 @@ solver path no longer calls the legacy Excel-based `model.py` or
 - `ea.py`: Gurobi-based exact assignment solver.
 - `eao.py`: SCIP/PySCIPOpt-based exact assignment solver.
 - `eah.py`: HiGHS/highspy-based exact assignment solver.
+- `eac.py`: COPT/coptpy-based exact assignment solver.
 - `ga.py`: genetic algorithm solver.
 - `router.py`: selects the solver from `config.algorithm.name`.
 - `inputs/instance*`: normalized sample cases.
@@ -22,10 +23,28 @@ solver path no longer calls the legacy Excel-based `model.py` or
 - `ea`: implemented.
 - `eao`: implemented.
 - `eah`: implemented.
+- `eac`: implemented; requires `coptpy==8.0.7` and a valid COPT 8 license.
 - `ha`: implemented.
 - `ga`: implemented.
 - `pso`, `sa`: implemented.
 - `ai`: reserved and currently returns `not_implemented`.
+
+Example COPT configuration (only `normal` mode is supported):
+
+```json
+{
+  "algorithm": {
+    "name": "eac",
+    "mode": "normal",
+    "obj": "maxRevenue",
+    "timeLimit": null,
+    "decimal": 5
+  }
+}
+```
+
+`obj` may also be `minTime` or `minPower`. A null `timeLimit` leaves the
+solver without an additional project-injected stopping limit.
 
 ## Run
 

@@ -15,6 +15,12 @@ algorithm_service/__pycache__/
 unified_framework/__pycache__/
 **/*.tar
 
+# Solver licenses must be provided at runtime, never committed.
+license.dat
+license.key
+**/license.dat
+**/license.key
+
 # Temporary run artifacts
 tmp_*/
 tmp*/

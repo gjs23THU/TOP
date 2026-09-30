@@ -1,0 +1,3 @@
+task_id,task_name,revenue,location,day,time,power,required,continuous,remote,exceptO,tag
+0,执行航天员出舱,4.0,"101,102",None,100.0,0.1,True,True,True,False,None
+1,5.12.	HTY试驾YQC,7.0,"201,202,203,204",None,102.2491400061652,1.2,True,True,True,False,None

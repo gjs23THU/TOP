@@ -6,6 +6,7 @@ BASE_URL="${BASE_URL%/}"
 INPUT_ZIP="${INPUT_ZIP:-instance1.zip}"
 OUTPUT_DIR="${OUTPUT_DIR:-output/instance1_docker_matrix}"
 TIME_LIMIT_SECONDS="${TIME_LIMIT_SECONDS:-120}"
+PRESERVE_TIME_LIMIT="${PRESERVE_TIME_LIMIT:-false}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 ALGORITHMS=(${ALGORITHMS:-ha ga sa pso})
@@ -42,12 +43,12 @@ make_case_zip() {
   local objective="$2"
   local output_zip="$3"
 
-  "$PYTHON_BIN" - "$INPUT_ZIP" "$output_zip" "$algorithm" "$objective" "$TIME_LIMIT_SECONDS" <<'PY'
+  "$PYTHON_BIN" - "$INPUT_ZIP" "$output_zip" "$algorithm" "$objective" "$TIME_LIMIT_SECONDS" "$PRESERVE_TIME_LIMIT" <<'PY'
 import json
 import sys
 import zipfile
 
-input_zip, output_zip, algorithm, objective, time_limit = sys.argv[1:6]
+input_zip, output_zip, algorithm, objective, time_limit, preserve_time_limit = sys.argv[1:7]
 required = ["config.json", "task.csv", "package.csv", "point.csv", "distance.csv", "time.csv", "power.csv"]
 
 with zipfile.ZipFile(input_zip, "r") as source:
@@ -70,7 +71,9 @@ config.setdefault("algorithm", {})
 config["algorithm"]["name"] = algorithm
 config["algorithm"]["mode"] = "normal"
 config["algorithm"]["obj"] = objective
-if algorithm == "ha":
+if preserve_time_limit.lower() in {"1", "true", "yes", "y"}:
+    pass
+elif algorithm == "ha":
     config["algorithm"]["timeLimit"] = None
 else:
     config["algorithm"]["timeLimit"] = int(time_limit)

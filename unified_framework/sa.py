@@ -384,12 +384,9 @@ class task_optimize(object):
             if pd.isna(locs).all() if isinstance(locs, list) else pd.isna(locs):
                 continue
             loc_list = locs if isinstance(locs, list) else [s.strip() for s in str(locs).split(",")]
-            pts = []
             for point in loc_list:
                 if point in self.__dmatrix.index and self.__dmatrix.loc[origin, point] >= self.__MDistance:
                     points_found.append(point)
-                    pts.append(point)
-            self.__task.at[index, "location"] = pts
         if len(points_found) == 0:
             path = "new-point.xlsx"
             sortedseries = self.__dmatrix.sort_values(by=[origin], ascending=False).loc[origin, :]
@@ -586,9 +583,13 @@ class task_optimize(object):
             if idx not in selected:
                 penalty += 10.0
 
-        rc = sum(1 for idx in self.__rem_idx if idx in selected)
-        if rc != 1:
-            penalty += abs(rc - 1) * 10.0
+        has_remote_far_point = any(
+            self.__is_remote_candidate(item.task_idx, item.location)
+            for seq in sol.days
+            for item in seq
+        )
+        if self.__rem_idx and not has_remote_far_point:
+            penalty += 10.0
 
         # ea.py uses equality: sum(continuous selected) == Mincontinuous.
         cc = sum(1 for idx in self.__con_idx if idx in selected)
@@ -634,6 +635,20 @@ class task_optimize(object):
                 if item.task_idx == task_idx:
                     found.append((d, pos))
         return found
+
+    def __is_remote_candidate(self, task_idx: int, location: str) -> bool:
+        if task_idx not in self.__rem_idx:
+            return False
+        return self.__dmatrix.loc["探测起点1", location] >= self.__MDistance
+
+    def __remote_candidates(self) -> List[Tuple[int, str]]:
+        return [
+            (task.idx, location)
+            for task in self.__tasks
+            if task.idx in self.__rem_idx
+            for location in task.locations
+            if self.__is_remote_candidate(task.idx, location)
+        ]
 
     def __check_tag_penalty(self, sol: _Solution) -> float:
         """Penalty version of ea.py's day/tag boundary equalities.
@@ -746,7 +761,7 @@ class task_optimize(object):
             if d is not None:
                 sol.days[d].insert(pos, _ScheduleItem(t.idx, loc))
 
-        # 4) fix remote = exactly 1
+        # 4) ensure at least one selected remote location exceeds max-distance
         self.__fix_remote(sol)
         return sol
 
@@ -781,17 +796,25 @@ class task_optimize(object):
         return best
 
     def __fix_remote(self, sol):
-        placed = self.__placed_indices(sol)
-        rp = [i for i in self.__rem_idx if i in placed]
-        if len(rp) == 0 and self.__rem_idx:
-            t = self.__task_by_idx[random.choice(self.__rem_idx)]
-            d, pos, loc = self.__best_insertion(sol, t)
-            if d is not None:
-                sol.days[d].insert(pos, _ScheduleItem(t.idx, loc))
-        elif len(rp) > 1:
-            for idx in rp[1:]:
-                for seq in sol.days:
-                    seq[:] = [item for item in seq if item.task_idx != idx]
+        candidates = self.__remote_candidates()
+        if not candidates:
+            return
+        for seq in sol.days:
+            for item in seq:
+                if self.__is_remote_candidate(item.task_idx, item.location):
+                    return
+
+        task_idx, location = random.choice(candidates)
+        for seq in sol.days:
+            for item in seq:
+                if item.task_idx == task_idx:
+                    item.location = location
+                    return
+
+        t = self.__task_by_idx[task_idx]
+        d, pos, _ = self.__best_insertion(sol, t)
+        if d is not None:
+            sol.days[d].insert(pos, _ScheduleItem(t.idx, location))
 
     # ================================================================
     #  Neighborhood operators

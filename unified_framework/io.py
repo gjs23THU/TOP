@@ -95,7 +95,7 @@ def _load_config(case_dir: Path) -> CaseConfig:
         if _to_none(algorithm_raw.get("random_seed")) is None
         else int(algorithm_raw["random_seed"]),
     )
-    if algorithm.name not in {"ea", "eao", "eah", "ha", "ga", "sa", "pso", "ai"}:
+    if algorithm.name not in {"ea", "eao", "eah", "eac", "ha", "ga", "sa", "pso", "ai"}:
         raise ValueError(f"Unsupported algorithm.name: {algorithm.name}")
     if algorithm.mode not in {"normal", "revisional", "back"}:
         raise ValueError(f"Unsupported algorithm.mode: {algorithm.mode}")
@@ -336,18 +336,25 @@ def write_result(case_dir: Path, result: SolveResult) -> SolveResult:
         "objective_value": result.objective_value,
         "schedule_path": result.schedule_path,
         "error": result.error,
+        "metrics": result.metrics,
     }
     result_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
 
 
-def write_error(case_dir: str | Path, case_id: str, exc: Exception) -> SolveResult:
+def write_error(
+    case_dir: str | Path,
+    case_id: str,
+    exc: Exception,
+    metrics: dict[str, Any] | None = None,
+) -> SolveResult:
     result = SolveResult(
         case_id=case_id,
         status=status_from_exception(exc),
         objective_value=None,
         schedule_path=None,
         error={"type": exc.__class__.__name__, "message": str(exc)},
+        metrics=metrics,
     )
     return write_result(Path(case_dir).resolve(), result)
 
@@ -356,6 +363,7 @@ def write_outputs(case: UnifiedCase, plan: SchedulePlan) -> SolveResult:
     case.output_dir.mkdir(parents=True, exist_ok=True)
     schedule_path = case.output_dir / "schedule.csv"
     result_path = case.output_dir / "result.json"
+    progress_path = case.output_dir / "progress.jsonl"
 
     schedule_ref: str | None = None
     if plan.status == "success" and (plan.rows is not None or plan.steps):
@@ -364,11 +372,23 @@ def write_outputs(case: UnifiedCase, plan: SchedulePlan) -> SolveResult:
     elif schedule_path.exists():
         schedule_path.unlink()
 
+    metrics = dict(plan.metrics or {})
+    if plan.progress:
+        progress_path.write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in plan.progress),
+            encoding="utf-8",
+        )
+        metrics["progress_path"] = "output/progress.jsonl"
+        metrics["progress_event_count"] = len(plan.progress)
+    elif progress_path.exists():
+        progress_path.unlink()
+
     result = SolveResult(
         case_id=case.config.case_id,
         status=plan.status,
         objective_value=plan.objective_value if plan.status == "success" else None,
         schedule_path=schedule_ref,
         error=None if plan.status == "success" else {"type": plan.status, "message": plan.message or ""},
+        metrics=metrics or None,
     )
     return write_result(case.case_dir, result)

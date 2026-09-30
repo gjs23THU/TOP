@@ -37,6 +37,8 @@ class SchedulePlan:
     status: str = "success"
     message: str | None = None
     rows: list[dict[str, Any]] | None = None
+    metrics: dict[str, Any] | None = None
+    progress: list[dict[str, Any]] | None = None
 
     def to_frame(self) -> pd.DataFrame:
         if self.rows is not None:
@@ -317,22 +319,49 @@ def feasible_locations(case: UnifiedCase, task: Task) -> list[int]:
     return locations
 
 
+def remote_candidate_location_ids(case: UnifiedCase, task: Task) -> list[int]:
+    if not task.remote:
+        return []
+    return [
+        location_id
+        for location_id in task.location_ids
+        if location_id in case.point_id_to_name
+        and matrix_value(case, case.distance, case.depot_id, location_id)
+        >= case.config.max_distance
+    ]
+
+
 def check_remote_requirement(case: UnifiedCase) -> ValidationResult:
     remote_tasks = [task for task in case.tasks if task.remote]
     if not remote_tasks:
         return ValidationResult(True)
 
     for task in remote_tasks:
-        for location_id in task.location_ids:
-            if location_id not in case.point_id_to_name:
-                continue
-            distance_from_depot = matrix_value(case, case.distance, case.depot_id, location_id)
-            if distance_from_depot >= case.config.max_distance:
-                return ValidationResult(True)
+        if remote_candidate_location_ids(case, task):
+            return ValidationResult(True)
 
     return ValidationResult(
         False,
         "No candidate point in remote tasks meets max-distance requirement.",
+    )
+
+
+def check_remote_selection(case: UnifiedCase, plan: SchedulePlan) -> ValidationResult:
+    remote_tasks = {task.uid: task for task in case.tasks if task.remote}
+    if not remote_tasks:
+        return ValidationResult(True)
+
+    for step in plan.steps:
+        if step.kind != "task" or step.task_uid not in remote_tasks:
+            continue
+        if (
+            matrix_value(case, case.distance, case.depot_id, step.location_id)
+            >= case.config.max_distance
+        ):
+            return ValidationResult(True)
+    return ValidationResult(
+        False,
+        "No selected remote task location meets max-distance requirement.",
     )
 
 
@@ -390,4 +419,4 @@ def validate_plan(case: UnifiedCase, plan: SchedulePlan) -> ValidationResult:
             return ValidationResult(False, f"Task {task.name} is not allowed on day {step.day}.")
         if step.location_id not in task.location_ids:
             return ValidationResult(False, f"Task {task.name} uses an invalid location.")
-    return check_remote_requirement(case)
+    return check_remote_selection(case, plan)

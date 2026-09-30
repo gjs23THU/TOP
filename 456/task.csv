@@ -1,0 +1,8 @@
+task_id,task_name,revenue,location,day,time,power,required,continuous,remote,exceptO,tag
+0,执行单点采样1,5.0,"101,102,103,104,105",1,20.0,133.33,False,False,False,False,None
+1,执行单点采样2,10.0,"201,202,203,204,205",2,20.0,133.33,True,False,True,False,None
+2,执行多点连续采样Ⅰ1,3.0,"10101,10102,10103",None,20.0,133.3,False,True,False,False,None
+3,执行多点连续采样Ⅰ2,3.0,"10201,10202,10203",None,20.0,133.3,False,True,False,False,None
+4,部署月面角反射器1,10.0,,None,15.0,100.0,True,False,False,True,None
+5,部署月面角反射器2,10.0,0,None,15.0,100.0,True,False,False,False,None
+6,磁选工具照料（加载月壤）,3.0,,None,10.0,60.0,True,False,False,False,None

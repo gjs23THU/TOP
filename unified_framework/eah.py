@@ -398,6 +398,7 @@ class _HighsModel:
         self._var_count = 0
         self._row_count = 0
         self._started = None
+        self._elapsed = None
         self._interrupted = False
 
     def addVars(self, keys, vtype="C", name="", ub=None):
@@ -574,10 +575,12 @@ class _HighsModel:
 
     def optimize(self, callback=None):
         self._started = time.perf_counter()
+        self._elapsed = None
         self._interrupted = False
         try:
             self._model.run()
         finally:
+            self._elapsed = time.perf_counter() - self._started
             self._capture_status()
 
     def _capture_status(self):
@@ -648,7 +651,40 @@ class _HighsModel:
     def getSolvingTime(self):
         if self._started is None:
             return 0.0
+        if self._elapsed is not None:
+            return self._elapsed
         return time.perf_counter() - self._started
+
+    def _info_value(self, *names):
+        try:
+            info = self._model.getInfo()
+        except Exception:
+            return None
+        for name in names:
+            if hasattr(info, name):
+                return getattr(info, name)
+        return None
+
+    def getBestBound(self):
+        return self._info_value("mip_dual_bound", "objective_bound")
+
+    def getGap(self):
+        return self._info_value("mip_gap")
+
+    def getNodeCount(self):
+        return self._info_value("mip_node_count")
+
+    def getNumVars(self):
+        return self._var_count
+
+    def getNumConstrs(self):
+        return self._row_count
+
+    def getVersion(self):
+        try:
+            return str(self._model.version())
+        except Exception:
+            return "unknown"
 
     def createPartialSol(self):
         return {}
@@ -734,6 +770,8 @@ class task_optimize(object):
         writeOutput=True,
         parallelWorkers=None,
         highsLog=None,
+        useHeuristicStart=True,
+        allowFallback=True,
     ):
         self.__objective = obj
         self.__Obj = [CONST.MAX_REVENUE, CONST.MIN_TIME, CONST.MIN_POWER]
@@ -784,6 +822,12 @@ class task_optimize(object):
         self.__fallback_schedule_df = None
         self.__fallback_objvalue = None
         self.__using_fallback = False
+        self.__use_heuristic_start = _coerce_bool(useHeuristicStart, True)
+        self.__allow_fallback = _coerce_bool(allowFallback, True)
+        self.__warm_start_accepted = False
+        self.__step_timings = {}
+        self.__run_elapsed = None
+        self.__progress_events = []
         return None
 
     def test_IO(self):
@@ -1055,12 +1099,9 @@ class task_optimize(object):
         ].index.to_list()
         points = []
         for index in remoteindex:
-            pts = []
             for point in self.__task.loc[index, "location"]:
                 if self.__dmatrix.loc["探测起点1", point] >= self.__MDistance:
                     points.append(point)
-                    pts.append(point)
-            self.__task.at[index, "location"] = pts
         if len(points) == 0:
             start = 0
             path = "new-point.xlsx"
@@ -1507,9 +1548,18 @@ class task_optimize(object):
         return None
 
     def add_remote_constrs(self):
+        if not self.__remtaskindex:
+            return None
+        point_name = self.__pointdf.reset_index().set_index("No")["index"].to_dict()
+        remote_points = [
+            (i, k)
+            for i, k in self.__point
+            if k in self.__remtaskindex
+            and self.__dmatrix.loc["探测起点1", point_name[i]] >= self.__MDistance
+        ]
         self.__m.addConstr(
             gp.quicksum(
-                (self.__x.sum("*", "*", "*", k) for k in self.__remtaskindex)
+                (self.__x.sum("*", "*", i, k) for i, k in remote_points)
             )
             >= 1,
             name="remote",
@@ -2388,7 +2438,10 @@ class task_optimize(object):
         return True
 
     def validate_schedule(self):
-        if not self.__validate_business_schedule(self.__plandf, "output"):
+        self.__business_validation_passed = self.__validate_business_schedule(
+            self.__plandf, "output"
+        )
+        if not self.__business_validation_passed:
             raise MIPError("Output schedule violates business validation rules")
         return None
 
@@ -2438,7 +2491,7 @@ class task_optimize(object):
         return accepted
 
     def build_heuristic_start(self):
-        if not self.__dataframes or len(self.__edges) < 1000:
+        if not self.__use_heuristic_start or not self.__dataframes or len(self.__edges) < 1000:
             print("[eah] WARMSTART skipped", flush=True)
             return None
         from . import ha
@@ -2471,7 +2524,24 @@ class task_optimize(object):
         if not self.__validate_business_schedule(ha_schedule, "ha_warmstart"):
             print("[eah] WARMSTART skipped because HA schedule failed business validation", flush=True)
             return None
-        self.__try_warmstart_schedule(ha_schedule, "ha", printreason=False, path=ha_path)
+        self.__warm_start_accepted = self.__try_warmstart_schedule(
+            ha_schedule,
+            "ha",
+            printreason=False,
+            path=ha_path,
+        )
+        if self.__warm_start_accepted:
+            self.__progress_events.append(
+                {
+                    "event": "warm_start",
+                    "elapsed_seconds": 0.0,
+                    "incumbent_objective": self.__finite_metric(self.__fallback_objvalue),
+                    "best_bound": None,
+                    "absolute_gap": None,
+                    "relative_gap": None,
+                    "solution_source": "heuristic_start",
+                }
+            )
         return None
 
     def run_opt(self):
@@ -2549,6 +2619,24 @@ class task_optimize(object):
             )
         if self.__m.SolCount >= 1:
             self.__objvalue = self.__m.objVal
+        incumbent = self.__finite_metric(self.__m.objVal) if self.__m.SolCount >= 1 else None
+        best_bound = self.__finite_metric(self.__m.getBestBound())
+        absolute_gap = (
+            abs(incumbent - best_bound)
+            if incumbent is not None and best_bound is not None
+            else None
+        )
+        self.__progress_events.append(
+            {
+                "event": "final",
+                "elapsed_seconds": self.__finite_metric(self.__m.getSolvingTime()),
+                "incumbent_objective": incumbent,
+                "best_bound": best_bound,
+                "absolute_gap": absolute_gap,
+                "relative_gap": self.__finite_metric(self.__m.getGap()),
+                "solution_source": "solver" if incumbent is not None else None,
+            }
+        )
         if self.__m.Status == gp.GRB.INFEASIBLE:
             self.__m.computeIIS()
             self.__m.write("infeasible.ilp")
@@ -2563,7 +2651,7 @@ class task_optimize(object):
             print(f"Optimal objective value: {self.__m.objVal}")
         elif self.__m.SolCount >= 1:
             print(f"Feasible objective value: {self.__m.objVal}")
-        elif self.__fallback_schedule_df is not None:
+        elif self.__allow_fallback and self.__fallback_schedule_df is not None:
             self.__using_fallback = True
             self.__plandf = self.__fallback_schedule_df.copy()
             self.__objvalue = self.__fallback_objvalue
@@ -3137,6 +3225,111 @@ class task_optimize(object):
     def schedule_frame(self):
         return self.__plandf.copy()
 
+    @staticmethod
+    def __finite_metric(value):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if np.isfinite(numeric) else None
+
+    def metrics(self):
+        incumbent = self.__finite_metric(self.__m.objVal) if self.__m.SolCount >= 1 else None
+        best_bound = self.__finite_metric(self.__m.getBestBound())
+        absolute_gap = (
+            abs(incumbent - best_bound)
+            if incumbent is not None and best_bound is not None
+            else None
+        )
+        first_feasible = next(
+            (
+                event["elapsed_seconds"]
+                for event in self.__progress_events
+                if event.get("event") == "incumbent"
+            ),
+            None,
+        )
+        model_steps = {
+            "gen_edges",
+            "add_variables",
+            "set_objective",
+            "add_indegree_constrs",
+            "add_outdegree_constrs",
+            "add_equaldegree_constrs",
+            "add_oodegree_constrs",
+            "add_rtask_constrs",
+            "add_otask_constrs",
+            "add_remote_constrs",
+            "add_time_constrs",
+            "add_day_constrs",
+            "add_power_constrs",
+            "add_safe_constrs",
+            "add_continuous_constr",
+            "add_noii_constrs",
+        }
+        postprocess_steps = {
+            "print_status",
+            "proc_res",
+            "cal_route",
+            "add_package",
+            "validate_schedule",
+            "write_excel",
+        }
+        return {
+            "solver_name": "highs",
+            "solver_version": self.__m.getVersion(),
+            "termination_status": str(self.__m.Status),
+            "model_build_seconds": sum(
+                value for key, value in self.__step_timings.items() if key in model_steps
+            ),
+            "solve_seconds": self.__finite_metric(self.__m.getSolvingTime()),
+            "postprocess_seconds": sum(
+                value for key, value in self.__step_timings.items() if key in postprocess_steps
+            ),
+            "algorithm_total_seconds": self.__run_elapsed,
+            "first_feasible_seconds": first_feasible,
+            "first_feasible_observed": first_feasible is not None,
+            "incumbent_objective": incumbent,
+            "best_bound": best_bound,
+            "absolute_gap": absolute_gap,
+            "relative_gap": self.__finite_metric(self.__m.getGap()),
+            "node_count": self.__finite_metric(self.__m.getNodeCount()),
+            "model_state_count": len(self.__point),
+            "model_edge_count": len(self.__edges),
+            "model_variable_count": sum(
+                len(values)
+                for values in (
+                    self.__x,
+                    self.__W,
+                    self.__Q,
+                    self.__Ws1,
+                    self.__Ws2,
+                    self.__Ws3,
+                    self.__Qs1,
+                    self.__Qs2,
+                    self.__Qs3,
+                )
+            ),
+            "solver_reported_variable_count": self.__m.getNumVars(),
+            "model_constraint_count": self.__m.getNumConstrs(),
+            "time_limit_seconds": self.__finite_metric(self.__time_limit),
+            "threads": int(self.__parallel_workers),
+            "warm_start_enabled": bool(self.__use_heuristic_start),
+            "warm_start_accepted": bool(self.__warm_start_accepted),
+            "warm_start_source": "per_solver_ha" if self.__use_heuristic_start else None,
+            "fallback_used": bool(self.__using_fallback),
+            "native_solution_found": self.__m.SolCount >= 1,
+            "business_validation_passed": getattr(
+                self, "_task_optimize__business_validation_passed", None
+            ),
+            "edge_generation_mode": self.__edge_generation_mode,
+            "edge_generation_workers": self.__edge_generation_workers,
+            "step_timings": dict(self.__step_timings),
+        }
+
+    def progress_events(self):
+        return [dict(event) for event in self.__progress_events]
+
     def __log_step_detail(self, step):
         if step == "gen_point":
             return f"points={len(self.__point)}"
@@ -3161,6 +3354,7 @@ class task_optimize(object):
             result = func()
         except Exception as exc:
             elapsed = time.perf_counter() - started
+            self.__step_timings[step] = elapsed
             print(
                 f"[eah] FAIL  {index:02d}/{total:02d} {step} elapsed={elapsed:.3f}s "
                 f"error={exc.__class__.__name__}: {exc}",
@@ -3168,6 +3362,7 @@ class task_optimize(object):
             )
             raise
         elapsed = time.perf_counter() - started
+        self.__step_timings[step] = elapsed
         detail = self.__log_step_detail(step)
         suffix = f" {detail}" if detail else ""
         print(f"[eah] END   {index:02d}/{total:02d} {step} elapsed={elapsed:.3f}s{suffix}", flush=True)
@@ -3220,7 +3415,8 @@ class task_optimize(object):
         total = len(steps)
         for index, (step, func) in enumerate(steps, start=1):
             self.__run_logged_step(index, total, step, func)
-        print(f"[eah] RUN end elapsed={time.perf_counter() - total_started:.3f}s", flush=True)
+        self.__run_elapsed = time.perf_counter() - total_started
+        print(f"[eah] RUN end elapsed={self.__run_elapsed:.3f}s", flush=True)
         return None
 
 
@@ -3246,7 +3442,7 @@ def solve(case, mode="normal"):
     kwargs = {
         "obj": objective,
         "decimal": case.config.algorithm.decimal,
-        "autoSave": True,
+        "autoSave": False,
         "writeOutput": False,
         "outputPath": str(case.output_dir / "eah_schedule.xlsx"),
         "dataFrames": {
@@ -3278,6 +3474,13 @@ def solve(case, mode="normal"):
     )
     if highs_log is not None:
         kwargs["highsLog"] = highs_log
+    use_heuristic_start = algorithm_raw.get(
+        "useHeuristicStart",
+        algorithm_raw.get("warmStart", True),
+    )
+    allow_fallback = algorithm_raw.get("allowFallback", True)
+    kwargs["useHeuristicStart"] = use_heuristic_start
+    kwargs["allowFallback"] = allow_fallback
     optimizer = task_optimize(**kwargs)
     optimizer.run()
     schedule_df = optimizer.schedule_frame()
@@ -3289,6 +3492,8 @@ def solve(case, mode="normal"):
         steps=[],
         rows=rows,
         objective_value=None if objective_value is None else float(objective_value),
+        metrics=optimizer.metrics(),
+        progress=optimizer.progress_events(),
     )
 
 

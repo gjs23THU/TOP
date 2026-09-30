@@ -36,6 +36,20 @@ docker run -d \
 - `-p 8000:8000` 表示宿主机也用 `8000` 端口访问。
 - `top_algorithm_runs` 用来持久化每次求解产生的输入和输出。
 
+若要运行 COPT 精确算法 `eac`，许可证不得写入镜像，应把宿主机许可证目录只读挂载到容器：
+
+```bash
+docker run -d \
+  --name top-algorithm-service \
+  -p 8000:8000 \
+  -v top_algorithm_runs:/data/runs \
+  -v /path/to/copt-license:/opt/copt-license:ro \
+  -e COPT_LICENSE_DIR=/opt/copt-license \
+  top-algorithm-service:latest
+```
+
+`/path/to/copt-license` 中必须包含与 COPT 8.x 兼容的 `license.dat` 和 `license.key`。未挂载许可证时，服务和其他算法仍可使用，只有 `eac` 请求会返回 `solver_error`。绑定用户名的个人许可证还必须与容器内运行用户匹配；常规容器部署应使用适用于容器的许可证类型。
+
 ## 4. 健康检查
 
 ```bash
@@ -147,5 +161,7 @@ docker rm top-algorithm-service
 - `ea` 是 Gurobi 精确算法，部署环境需要可用的 Gurobi 授权。
 - `eao` 是 SCIP/PySCIPOpt 精确算法，部署环境需要安装 `pyscipopt`。
 - `eah` 是 HiGHS/highspy 精确算法，部署环境需要安装 `highspy`。
+- `eac` 是 COPT/coptpy 精确算法，镜像固定使用 `coptpy==8.0.7`，运行时需要有效的 COPT 8.x 许可证。
+- `coptpy==8.0.7` 在 PyPI 提供 CPython 3.12 的 Linux amd64/arm64 wheel，由标准依赖安装流程按镜像架构选择。
 - 默认单个上传文件大小上限为 200MB。
 - 若宿主机 8000 端口被占用，可改成 `-p 8080:8000`，访问地址相应改为 `http://127.0.0.1:8080`。
